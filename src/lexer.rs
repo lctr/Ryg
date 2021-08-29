@@ -1,18 +1,5 @@
 use super::token::Token;
 use std::{i64, iter::Peekable, str::Chars};
-// #[derive(Clone, Debug, PartialEq, Eq)]
-// pub enum Token {
-//   String(String),
-//   Number(String, u8),
-//   Variable(String),
-//   Symbol(String),
-//   Boolean(String),
-//   Operator(String),
-//   Keyword(String),
-//   Punct(char),
-//   Eof(),
-//   Empty(),
-// }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
@@ -52,10 +39,7 @@ impl<'a> Lexer<'a> {
   }
 
   pub fn get_pos(&mut self) -> Pos {
-    Pos {
-      line: self.line,
-      col: self.col,
-    }
+    Pos::new(self)
   }
 
   pub fn peek(&mut self) -> Token {
