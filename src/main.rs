@@ -11,15 +11,9 @@ fn main() {
 
 fn inspect_tokens(src: &str) {
   let mut lexer = Lexer::new(src);
-  let mut token = lexer.peek();
-  // let mut done = false;
-  println!("{:?}", src);
+  println!("source: {:?}", src);
   while !lexer.eof() {
     println!("{:?}", lexer.next());
-    // if this prints, then lexer.eof fails somehow
-    if token.eq(&Token::Empty()) {
-      println!("EOF FAIL");
-    }
   }
 }
 
