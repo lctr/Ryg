@@ -1,5 +1,5 @@
 use super::token::Token;
-use std::{i64, iter::Peekable, str::Chars};
+use std::{fmt, i64, iter::Peekable, str::Chars};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
@@ -18,6 +18,12 @@ impl Pos {
   }
 }
 
+impl fmt::Display for Pos {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "{}:{}", self.line, self.col)
+  }
+}
+
 #[derive(Debug)]
 pub struct Lexer<'a> {
   pub pos: usize,
@@ -30,7 +36,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
   pub fn new(src: &str) -> Lexer {
     Lexer {
-      chars: src.chars().peekable(),
+      chars: src.trim_end().chars().peekable(),
       pos: 0,
       line: 1,
       col: 0,
@@ -45,7 +51,8 @@ impl<'a> Lexer<'a> {
   pub fn peek(&mut self) -> Token {
     let t = &self.current;
     return if *t == Token::Empty() {
-      self.next_token()
+      self.current = self.next_token();
+      self.current.to_owned()
     } else {
       t.to_owned()
     };
@@ -80,17 +87,26 @@ impl<'a> Lexer<'a> {
         self.comment();
         self.next_token()
       }
-      '"' => Token::String(self.escaped('"')),
+      '"' => Token::String(self.escaped(&ch)),
+
       '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' => Token::Punct(self.chars.next().unwrap()),
+
       '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '&' | '@' | '!' | '?' | ':' | '\\' | '$'
       | '#' => Token::Operator(self.eat_while(is_op_char)),
+
       '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' => self.number(),
+
       '\0' => Token::Eof(),
+
       _ => {
         if (ch).is_ascii_alphabetic() {
           return self.variable();
         } else {
-          panic!("Unable to recognize character {:?}", &ch)
+          panic!(
+            "Unable to recognize character {:?} at {:#?}",
+            &ch,
+            self.get_pos()
+          )
         }
       }
     }
@@ -108,6 +124,7 @@ impl<'a> Lexer<'a> {
     }
     word
   }
+
   fn variable(&mut self) -> Token {
     let word = self.eat_while(|c| c.is_alphanumeric() || c == '\'');
     // let w = word.as_str();
@@ -117,34 +134,48 @@ impl<'a> Lexer<'a> {
       _ => Token::Variable(word),
     }
   }
-  fn escaped(&mut self, end: char) -> String {
+
+  fn escaped(&mut self, end: &char) -> String {
     let mut escaped = false;
     let mut word = String::new();
     self.chars.next();
+
     while !self.eof() {
       let c = self.chars.next().unwrap();
+      // println!("{:?}", &c);
       if escaped {
         escaped = false;
         // word.push(c);
         match c {
           'b' | 't' | 'n' | 'f' | 'r' => {
-            word.push('\\');
-            word.push(c);
+            &word.push('\\');
+            &word.push(c);
           }
           _ => {
-            word.push(c);
+            &word.push(c);
+            continue;
           }
         }
         continue;
-      } else if c == end {
+      } else if c == *end {
         break;
       } else if c == '\\' {
         escaped = true;
       } else {
-        word.push(c);
+        &word.push(c);
       }
     }
     word
+  }
+
+  fn unicode(&mut self) {
+    let len = if self.chars.peek().unwrap() == &'u' {
+      4
+    } else {
+      6
+    };
+    let w = self.eat_while(|_| --len > 0);
+    let n = integer(&w, 16);
   }
 
   fn comment(&mut self) {
@@ -237,15 +268,15 @@ fn parse_number<K>(number: String, base: u8) {
   }
 }
 
-fn integer(num: &str, base: u32) -> i32 {
-  match i64::from_str_radix(num, base) {
+fn integer(word: &str, base: u32) -> i32 {
+  match i64::from_str_radix(word, base) {
     Ok(n) => n as i32,
     Err(_) => 0,
   }
 }
 
-fn floating(num: &String) -> f64 {
-  match num.parse::<f64>() {
+fn floating(word: &String) -> f64 {
+  match word.parse::<f64>() {
     Ok(n) => n,
     Err(_) => 0.0,
   }
