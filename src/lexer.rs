@@ -36,7 +36,7 @@ impl<'a> Lexer<'a> {
   }
 
   pub fn eof(&mut self) -> bool {
-    self.src.peek() == &'\0' //|| Token::Eof().eq(&self.current) && self.pos > 0
+    self.src.peek() == &'\0'
   }
 
   pub fn next(&mut self) -> Token {
@@ -51,13 +51,10 @@ impl<'a> Lexer<'a> {
 
   pub fn next_token(&mut self) -> Token {
     self.eat_while(char::is_whitespace);
-
     if self.eof() {
       return self.current.to_owned();
     }
-
     let ch = *self.src.peek();
-
     match &ch {
       '\0' => Token::Eof(),
       '~' => {
@@ -85,8 +82,6 @@ impl<'a> Lexer<'a> {
       }
     }
   }
-  // turns out there's a built-in function for this
-  // `take_while` ! current impl left for edu purposes
   pub fn eat_while<F: FnMut(char) -> bool>(&mut self, mut pred: F) -> String {
     let mut word = String::new();
     while !self.eof() && self.src.peek_iter().map_or(false, |c| pred(*c)) {
@@ -209,21 +204,6 @@ impl<'a> Lexer<'a> {
       }
     });
     Token::Number(number, base)
-  }
-}
-
-pub fn parse_number<K>(number: String, base: u8) {
-  if base > 0 {
-    // integer(&number, base.into())
-
-    // Token::Int(
-    //   String::from(&number),
-    //   integer(number.trim_start_matches("0x"), base.into()),
-    // )
-  } else {
-    // floating(&number)
-
-    // Token::Number(String::from(&number), floating(&number))
   }
 }
 
