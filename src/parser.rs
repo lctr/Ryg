@@ -17,20 +17,33 @@ use std::fmt;
 // }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Case(pub Box<Expr>, pub Vec<Expr>, pub Box<Expr>);
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unary(pub Token, pub Box<Expr>);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Assign(pub Token, pub Box<Expr>, pub Box<Expr>);
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
   Literal(Token),
-  Unary(Token, Box<Expr>),
+  Unary(Unary),
   Binary(Token, Box<Expr>, Box<Expr>),
-  Assign(Token, Box<Expr>, Box<Expr>),
+  Assign(Assign),
   Block(Vec<Expr>),
   Vector(Vec<Expr>),
   Lambda(Option<String>, Vec<String>, Box<Expr>),
   Conditional(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
   Let(Vec<Expr>, Box<Expr>),
   Call(Box<Expr>, Vec<Expr>),
-  Case(Box<Expr>, Vec<Expr>, Box<Expr>),
+  Case(Case),
   Tuple(Vec<Expr>),
+}
+
+impl Expr {
+  pub fn new() {}
+  pub fn bin_op() {}
 }
 
 // impl fmt::Debug for Expr {
@@ -53,25 +66,6 @@ pub enum Expr {
 //   }
 // }
 
-impl Expr {
-  pub fn new() {}
-  pub fn from(expr: Expr) {
-    match expr {
-      Expr::Literal(t) => {}
-      Expr::Unary(t, e) => {}
-      Expr::Binary(a, b, c) => {}
-      Expr::Assign(a, b, c) => {}
-      Expr::Block(a) => {}
-      Expr::Call(a, b) => {}
-      Expr::Case(a, b, c) => {}
-      Expr::Conditional(a, b, c) => {}
-      Expr::Lambda(a, b, c) => {}
-      Expr::Let(a, b) => {}
-      Expr::Vector(a) => {}
-      Expr::Tuple(_) => {}
-    }
-  }
-}
 
 pub struct Parser<'a> {
   lexer: Lexer<'a>,
@@ -170,12 +164,11 @@ impl<'a> Parser<'a> {
     let cond = self.expression();
     self.eat("then");
     let then = self.expression();
-    let mut deft = None;
-    if self.match_literal("else") {
+    let deft = if self.match_literal("else") {
       self.eat("else");
-      deft = Some(Box::new(self.expression()))
+      Some(Box::new(self.expression()))
     } else {
-      deft = None
+      None
     };
     Expr::Conditional(Box::new(cond), Box::new(then), deft)
   }
@@ -294,7 +287,7 @@ impl<'a> Parser<'a> {
     if token.match_literal("!") || token.match_literal("-") {
       self.next();
       let right = self.atom();
-      Expr::Unary(token, Box::new(right))
+      Expr::Unary(Unary(token, Box::new(right)))
     } else {
       self.binary(|p| p.exponent(), vec!["**"])
     }
@@ -354,6 +347,9 @@ fn terminal<'a>(ref mut parser: &mut Parser<'a>) -> Expr {
         panic!("")
       }
     },
+    Token::Punct('[') => {
+      Expr::Vector(parser.delimited(("[", ",", "]"), &mut |p: &mut Parser<'a>| p.expression()))
+    }
     Token::String(_)
     | Token::Number(_, _)
     | Token::Variable(_)
@@ -369,12 +365,9 @@ fn terminal<'a>(ref mut parser: &mut Parser<'a>) -> Expr {
 #[cfg(test)]
 
 mod tests {
-
   use crate::parser::terminal;
-
   // use super::Lexer;
   use super::{Parser, Streaming};
-
   // use super::Token;
   fn inspect_tokens(src: &str) {
     let mut parser = Parser::new(src);
@@ -396,7 +389,7 @@ mod tests {
 
   #[test]
   fn test_vector() {
-    let src = "2 + 4 / 0x55";
+    let src = "[2 + 4 / 0x55]";
     let mut parser = Parser::new(src);
     println!("source: {}", src);
     let ast = parser.parse();
