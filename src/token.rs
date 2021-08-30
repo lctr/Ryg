@@ -84,6 +84,12 @@ impl fmt::Display for Pos {
   }
 }
 
+pub trait Streaming<T> {
+  fn peek(&mut self) -> T;
+  fn next(&mut self) -> T;
+  fn eof(&mut self) -> bool;
+}
+
 #[derive(Debug)]
 pub struct Stream<'a> {
   pub pos: Pos,
