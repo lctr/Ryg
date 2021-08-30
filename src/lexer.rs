@@ -1,51 +1,28 @@
-use super::token::Token;
-use std::{fmt, i64, iter::Peekable, str::Chars};
+use super::token::{Pos, Stream, Token};
+use std::i64;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Pos {
-  line: usize,
-  col: usize,
-}
-
-impl Pos {
-  pub fn new(lexer: &Lexer) -> Pos {
-    let line = &lexer.line;
-    let col = &lexer.col;
-    Pos {
-      line: *line,
-      col: *col,
-    }
-  }
-}
-
-impl fmt::Display for Pos {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}:{}", self.line, self.col)
-  }
-}
+// TODO
+// pub enum LexerError {
+//   Unknown(String, Pos),
+// }
 
 #[derive(Debug)]
 pub struct Lexer<'a> {
-  pub pos: usize,
-  pub line: usize,
-  pub col: usize,
-  chars: Peekable<Chars<'a>>,
+  src: Stream<'a>,
   current: Token,
 }
 
+#[allow(dead_code)]
 impl<'a> Lexer<'a> {
   pub fn new(src: &str) -> Lexer {
     Lexer {
-      chars: src.trim_end().chars().peekable(),
-      pos: 0,
-      line: 1,
-      col: 0,
+      src: Stream::new(src),
       current: Token::Empty(),
     }
   }
 
   pub fn get_pos(&mut self) -> Pos {
-    Pos::new(self)
+    self.src.pos.clone()
   }
 
   pub fn peek(&mut self) -> Token {
@@ -59,7 +36,7 @@ impl<'a> Lexer<'a> {
   }
 
   pub fn eof(&mut self) -> bool {
-    self.chars.peek() == None || Token::Eof().eq(&self.current) && self.pos > 0
+    self.src.peek() == &'\0' //|| Token::Eof().eq(&self.current) && self.pos > 0
   }
 
   pub fn next(&mut self) -> Token {
@@ -79,7 +56,7 @@ impl<'a> Lexer<'a> {
       return self.current.to_owned();
     }
 
-    let ch = *self.chars.peek().unwrap_or(&'\0');
+    let ch = *self.src.peek();
 
     match &ch {
       '\0' => Token::Eof(),
@@ -89,15 +66,12 @@ impl<'a> Lexer<'a> {
       }
       '"' => Token::String(self.escaped(&ch)),
 
-      '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' => Token::Punct(self.chars.next().unwrap()),
+      '(' | ')' | '[' | ']' | '{' | '}' | ',' => Token::Punct(self.src.next()),
 
-      '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '&' | '@' | '!' | '?' | ':' | '\\' | '$'
-      | '#' => Token::Operator(self.eat_while(is_op_char)),
+      '+' | '-' | '*' | '/' | '%' | '^' | '=' | '<' | '>' | '&' | '@' | '!' | '?' | ':' | '\\'
+      | '|' | '$' | '#' => Token::Operator(self.eat_while(is_op_char)),
 
       '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' => self.number(),
-
-      '\0' => Token::Eof(),
-
       _ => {
         if (ch).is_ascii_alphabetic() {
           return self.variable();
@@ -113,14 +87,10 @@ impl<'a> Lexer<'a> {
   }
   // turns out there's a built-in function for this
   // `take_while` ! current impl left for edu purposes
-  pub fn eat_while<F>(&mut self, mut pred: F) -> String
-  where
-    F: FnMut(char) -> bool,
-  {
+  pub fn eat_while<F: FnMut(char) -> bool>(&mut self, mut pred: F) -> String {
     let mut word = String::new();
-    while !self.eof() && self.chars.peek().map_or(false, |c| pred(*c)) {
-      word.push(self.chars.next().unwrap());
-      self.pos += 1;
+    while !self.eof() && self.src.peek_iter().map_or(false, |c| pred(*c)) {
+      word.push(self.src.next());
     }
     word
   }
@@ -138,10 +108,10 @@ impl<'a> Lexer<'a> {
   fn escaped(&mut self, end: &char) -> String {
     let mut escaped = false;
     let mut word = String::new();
-    self.chars.next();
+    self.src.next();
 
     while !self.eof() {
-      let c = self.chars.next().unwrap();
+      let c = self.src.next();
       // println!("{:?}", &c);
       if escaped {
         escaped = false;
@@ -168,28 +138,15 @@ impl<'a> Lexer<'a> {
     word
   }
 
-  fn unicode(&mut self) {
-    let len = if self.chars.peek().unwrap() == &'u' {
-      4
-    } else {
-      6
-    };
+  fn unicode(&mut self) -> String {
+    let len = if self.src.peek() == &'u' { 4 } else { 6 };
     let w = self.eat_while(|_| --len > 0);
     let n = integer(&w, 16);
+    w
   }
 
   fn comment(&mut self) {
-    while let Some(&c) = self.chars.peek() {
-      if c.ne(&'\n') {
-        self.pos += 1;
-        self.col += 1;
-        self.chars.next();
-      } else {
-        self.line += 1;
-        self.col = 0;
-        break;
-      }
-    }
+    self.eat_while(|c| c.ne(&'\n'));
   }
 
   fn number(&mut self) -> Token {
@@ -204,6 +161,7 @@ impl<'a> Lexer<'a> {
             return false;
           } else {
             infixed = true;
+            base = 10;
             return true;
           }
         }
@@ -236,6 +194,7 @@ impl<'a> Lexer<'a> {
           } else {
             infixed = true;
             float = true;
+            base = 10;
             return true;
           }
         }
@@ -253,7 +212,7 @@ impl<'a> Lexer<'a> {
   }
 }
 
-fn parse_number<K>(number: String, base: u8) {
+pub fn parse_number<K>(number: String, base: u8) {
   if base > 0 {
     // integer(&number, base.into())
 
@@ -268,54 +227,91 @@ fn parse_number<K>(number: String, base: u8) {
   }
 }
 
-fn integer(word: &str, base: u32) -> i32 {
+pub fn integer(word: &str, base: u32) -> i32 {
   match i64::from_str_radix(word, base) {
     Ok(n) => n as i32,
     Err(_) => 0,
   }
 }
 
-fn floating(word: &String) -> f64 {
+pub fn floating(word: &String) -> f64 {
   match word.parse::<f64>() {
     Ok(n) => n,
     Err(_) => 0.0,
   }
 }
 
-fn is_digit(c: char) -> bool {
+pub fn is_digit(c: char) -> bool {
   c.is_digit(36)
 }
 
-fn is_op_char(c: char) -> bool {
+pub fn is_punct(c: char) -> bool {
   match c {
-    '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '|' | '&' | '@' | '!' | '~' | '?' | ':'
-    | '\\' | '$' | '#' => true,
+    '(' | ')' | '[' | ']' | ';' | ',' => true,
     _ => false,
   }
 }
 
-fn is_bin(c: char) -> bool {
+pub fn is_op_char(c: char) -> bool {
+  match c {
+    '=' | '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '|' | '&' | '@' | '!' | '~' | '?'
+    | ':' | '\\' | '$' | '#' => true,
+    _ => false,
+  }
+}
+
+pub fn is_bin(c: char) -> bool {
   match c {
     '0' | '1' => true,
     _ => false,
   }
 }
 
-fn is_oct(c: char) -> bool {
+pub fn is_oct(c: char) -> bool {
   match c {
     '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' => true,
     _ => false,
   }
 }
 
-fn is_hex(c: char) -> bool {
+pub fn is_hex(c: char) -> bool {
   c.is_ascii_hexdigit()
 }
 
-fn is_kw(s: &str) -> bool {
+pub fn is_kw(s: &str) -> bool {
   match s {
     "do" | "let" | "var" | "if" | "then" | "else" | "true" | "false" | "at" | "with" | "in"
     | "case" | "of" | "fn" | "is" | "loop" => true,
     _ => false,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::Lexer;
+  use super::Token;
+  fn inspect_tokens(src: &str) {
+    let mut lexer = Lexer::new(src);
+    println!("source: {:?}\n", src);
+    let mut i = 0;
+    while !lexer.eof() {
+      i += 1;
+      println!("[{}] {:?}", i, lexer.next());
+    }
+    println!("");
+  }
+  #[test]
+  fn digits_decimal() {
+    let src = "3.14";
+    inspect_tokens(src);
+    let mut lexer = Lexer::new(src);
+    assert_eq!(lexer.next(), Token::Number(String::from(src), 10));
+  }
+  #[test]
+  fn lambda_call() {
+    let src = "say'hi(\"hello!\")";
+    inspect_tokens(src);
+    let mut lexer = Lexer::new(src);
+    assert_eq!(lexer.next(), Token::Variable(String::from("say'hi")))
   }
 }
