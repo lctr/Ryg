@@ -112,6 +112,10 @@ impl Token {
     self.literal() == word
   }
 
+  pub fn is_atomic(&self) -> bool {
+    matches!(self, Self::Boolean(_) | Self::Number(..) | Self::String(_))
+  }
+
   /// Returns `true` if the token is [`Number`].
   ///
   /// [`Number`]: Token::Number
@@ -193,5 +197,15 @@ mod test {
     break, ~ éé ʃ",
     );
     assert_eq!(Token::Number("1".to_string(), 0).is_number(), true)
+  }
+
+  #[test]
+  fn test_atomics() {
+    let number = Token::Number("10".to_owned(), 0);
+    let string = Token::String("hi".to_owned());
+    let boolean = Token::Boolean("true".to_owned());
+    for t in [number, string, boolean].iter() {
+      assert_eq!(t.is_atomic(), true);
+    }
   }
 }
