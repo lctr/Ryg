@@ -1,26 +1,27 @@
-mod lexer;
-mod token;
-use lexer::Lexer;
-use token::Token;
+mod evaluating;
+mod lexing;
+mod parsing;
 
-fn main() {
-  let src = String::from("print \"world\"");
-  // let src = String::from("do");
-  inspect_tokens(&src);
-}
+mod halt;
 
-fn inspect_tokens(src: &str) {
-  let mut lexer = Lexer::new(src);
-  println!("source: {:?}", src);
-  while !lexer.eof() {
-    println!("{:?}", lexer.next());
-  }
-}
+use std::{
+  fs::File,
+  io::{BufReader, Read, Result},
+  path::PathBuf,
+};
 
-#[cfg(test)]
-mod tests {
-  #[test]
-  fn it_works() {
-    assert_eq!(2 + 2, 4);
+#[allow(dead_code)]
+fn main() {}
+
+fn read_text_file(path: PathBuf) -> Result<String> {
+  let file = File::open(path)?;
+  let mut buf = BufReader::new(file);
+  let mut program = String::new();
+  match buf.read_to_string(&mut program) {
+    Ok(_) => Ok(program),
+    Err(e) => {
+      println!("{:?}", e);
+      Ok("".to_string())
+    }
   }
 }
