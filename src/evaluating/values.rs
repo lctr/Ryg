@@ -1,11 +1,13 @@
-// use std::fmt::{Display, Formatter, Result};
-
 use std::error::Error;
+use std::fmt;
 use std::ops::Add;
 use std::rc::Rc;
 
+use crate::halt::Halt;
 use crate::lexing::token::Token;
 use crate::parsing::expression::Expr;
+
+use crate::evaluating::environment::Envr;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Atom {
@@ -63,10 +65,10 @@ pub fn parse_number(number: String, base: u8) -> (Option<i32>, Option<f64>) {
 pub struct Lambda {
   pub name: Option<String>,
   pub prams: Rc<Vec<String>>,
-  pub body: Rc<Expr>,
+  pub body: Box<Expr>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum RygVal {
   Nil(),
   Bool(bool),
@@ -75,8 +77,25 @@ pub enum RygVal {
   String(String),
   Vector(Vec<RygVal>),
   Lambda(Lambda),
-  /* Function(fn(&[RygVal]) -> Result<RygVal<'a>, Halt<'a>>),
-   */
+}
+
+pub const TRUE: RygVal = RygVal::Bool(true);
+pub const FALSE: RygVal = RygVal::Bool(false);
+pub const NIL: RygVal = RygVal::Nil();
+pub const EMPTY: RygVal = RygVal::Vector(vec![]);
+
+impl fmt::Debug for RygVal {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match self {
+      RygVal::Nil() => write!(f, "nil"),
+      RygVal::Bool(b) => write!(f, "{:?}", b),
+      RygVal::Int(n) => write!(f, "{:?}", n),
+      RygVal::Float(q) => write!(f, "{:?}", q),
+      RygVal::String(s) => write!(f, "{:?}", s),
+      RygVal::Vector(v) => write!(f, "{:?}", v),
+      RygVal::Lambda(l) => write!(f, "{:?}", l),
+    }
+  }
 }
 
 impl RygVal {
