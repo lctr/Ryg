@@ -218,7 +218,7 @@ pub fn is_digit(c: char) -> bool {
 }
 
 pub fn is_punct(c: char) -> bool {
-  matches!(c, '(' | ')' | '[' | ']' | '|' | ';' | ',')
+  matches!(c, '(' | ')' | '{' | '}' | '[' | ']' | '|' | ';' | ',')
 }
 
 pub fn is_op_char(c: char) -> bool {
