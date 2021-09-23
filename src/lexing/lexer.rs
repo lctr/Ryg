@@ -56,7 +56,6 @@ impl<'a> Lexer<'a> {
 
   pub fn token(&mut self) -> Token {
     if let Some(tok) = self.queue.pop() {
-      self.src.next();
       return tok;
     };
     self.eat_while(char::is_whitespace);
@@ -231,7 +230,6 @@ impl<'a> Lexer<'a> {
     let mut setting: fn(char) -> bool = is_digit;
     let mut seps = 0;
     let mut dot_ct = 0;
-    let mut print = &mut |c: char| println!("{:?}", c);
     let number = self.eat_while(|c| -> bool {
       match c {
         '_' => true,
@@ -284,6 +282,7 @@ impl<'a> Lexer<'a> {
       }
     });
     if dot_ct == 2 {
+      let mut pos2 = pos.clone();
       let num = Token::Number(
         number.replace('_', "").trim_end_matches('.').to_string(),
         0,
@@ -291,9 +290,15 @@ impl<'a> Lexer<'a> {
       );
       let should_be_dot = self.src.peek();
       if let Some('.') = self.src.peek() {
-        self.next();
-        let pos2 = self.get_pos();
-        self.queue.push(Token::Operator("..".to_string(), pos2));
+        pos2.next(&'.');
+        self.src.next();
+        if let Some('.') = self.src.peek() {
+          self.src.next();
+          self.queue.push(Token::Operator("...".to_string(), pos2));
+        } else {
+          self.queue.push(Token::Operator("..".to_string(), pos2));
+        }
+        self.src.pos.next(&'.');
         num
       } else {
         Token::Invalid(format!("Invalid sequence! Expected a second `.`, after '{}', but instead got {:?}", num, should_be_dot), self.get_pos())
@@ -502,7 +507,7 @@ mod tests {
 
   #[test]
   fn from_to() {
-    let src = "3..14";
+    let src = "3...14";
     inspect_tokens(src);
     let mut lexer = Lexer::new(src);
     assert_eq!(
