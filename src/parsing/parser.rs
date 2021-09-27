@@ -60,14 +60,14 @@ impl<'a> Parser<'a> {
   }
 
   pub fn eat(&mut self, literal: &str) -> Maybe<Token> {
-    if !self.state.is_halted() && self.word() == literal {
+    if !self.state.is_halted() && self.match_literal(literal) {
       Ok(self.next())
     } else {
       let p = self.get_pos();
       let halt = Halt::Unexpected(format!(
         "Expected '{}', but instead found '{}' {:?}",
         literal,
-        self.word(),
+        self.peek().literal(),
         p
       ));
       panic!("{}", halt)
@@ -80,16 +80,12 @@ impl<'a> Parser<'a> {
     }
   }
 
-  pub fn word(&mut self) -> String {
-    self.peek().literal()
-  }
-
   pub fn match_literal(&mut self, s: &str) -> bool {
     self.peek().match_literal(s)
   }
 
   pub fn match_any_of(&mut self, literals: &[&str]) -> bool {
-    literals.contains(&self.word().as_str())
+    self.peek().match_any_of(literals)
   }
 
   pub fn maybe_delimited<K, F: FnMut(&mut Self) -> K>(
@@ -141,7 +137,11 @@ impl<'a> Parser<'a> {
         panic!("{}; token: {}", h, t);
       } else {
         body.push(expr);
-        self.ignore(";");
+        if !self.done() {
+          // self.eat(";");
+          // replace with eat once error handling is finalized
+          self.ignore(";");
+        }
       };
     }
     Expr::Block(body)
@@ -155,9 +155,9 @@ impl<'a> Parser<'a> {
 
   pub fn maybe_call<F: FnMut(&mut Self) -> Expr>(
     &mut self,
-    mut parser: F,
+    mut parselet: F,
   ) -> Expr {
-    let expr = parser(self);
+    let expr = parselet(self);
     let mut token = self.peek();
     if token.match_literal("(") {
       self.call(expr)
@@ -169,13 +169,18 @@ impl<'a> Parser<'a> {
   pub fn call(&mut self, expr: Expr) -> Expr {
     Expr::Call(
       Box::new(expr.clone()),
-      self.delimited(("(", ",", ")"), &mut Parser::expression),
-      None,
+      self.delimited(("(", ",", ")"), &mut Self::expression),
+      match expr {
+        Expr::Literal(id) => Some(id.literal()),
+        Expr::Lambda(n, ..) => n,
+        Expr::Call(.., n) => n,
+        _ => None,
+      },
     )
   }
 
   pub fn atom(&mut self) -> Expr {
-    self.maybe_call(Parser::terminal)
+    self.maybe_call(Self::terminal)
   }
 
   pub fn maybe_binary(&mut self) -> Expr {
@@ -442,17 +447,11 @@ impl<'a> Parser<'a> {
     }
   }
 
-  fn twice<E, F: FnMut(&mut Self) -> E>(
-    &mut self,
-    ref mut parser: F,
-  ) -> (E, E) {
-    (parser(self), parser(self))
-  }
-
   pub fn looping(&mut self) -> Expr {
     self.eat("loop");
-    let (cond, body) = self.twice(|p| Box::new(p.maybe_block()));
-    Expr::Loop(cond, body)
+    let cond = self.maybe_block();
+    let body = self.maybe_block();
+    Expr::Loop(Box::new(cond), Box::new(body))
   }
 
   pub fn maybe_tuple(&mut self) -> Expr {
@@ -500,12 +499,7 @@ impl<'a> Parser<'a> {
         conds.push(expr)
       }
     });
-    return Expr::List(Box::new(Definition {
-      item: head,
-      ranges,
-      fixed,
-      conds,
-    }));
+    Expr::List(Box::new(Definition::new(head, ranges, fixed, conds)))
   }
 
   pub fn maybe_list(&mut self) -> Expr {
@@ -527,10 +521,11 @@ impl<'a> Parser<'a> {
     } else {
       // it is an error to get here! list brackets not closed out
       let pos = self.get_pos();
-      self.unknown(
-        format!("Unable to find closing square bracket {:?}", pos),
-        Some("]"),
-      )
+      panic!("Unable to find closing square bracket {:?}", pos);
+      // self.unknown(
+      //   format!("Unable to find closing square bracket {:?}", pos),
+      //   Some("]"),
+      // )
     }
   }
   pub fn terminal(&mut self) -> Expr {
@@ -572,9 +567,23 @@ impl<'a> Parser<'a> {
         self.next();
         self.indexish(|_| Expr::Literal(token.to_owned()))
       }
+      Token::Number(..) => {
+        self.next();
+        if self.match_literal("..") {
+          self.next();
+          let limit = match self.peek() {
+            Token::Number(..) | Token::Identifier(..) => {
+              Some(Box::new(Expr::Literal(self.next())))
+            }
+            _ => None,
+          };
+          Expr::Iter(Box::new(Expr::Literal(token.clone())), limit)
+        } else {
+          Expr::Literal(token.to_owned())
+        }
+      }
       Token::Char(..)
       | Token::Meta(..)
-      | Token::Number(..)
       | Token::Symbol(..)
       | Token::Boolean(..) => {
         self.next();
@@ -669,66 +678,6 @@ impl<'a> Parser<'a> {
       },
       kind: self.annotation(),
     }
-
-    // match shape {
-    //   Shape::Atom => Parameter {
-    //     name: self.next(),
-    //     kind: self.annotation(),
-    //     shape,
-    //     inner: vec![],
-    //     reqs: vec![],
-    //     pattern: None,
-    //   },
-    //   Shape::Tuple => todo!(),
-    //   Shape::Vector => {
-    //     let prefix = token.literal();
-    //     self.delimited((&prefix, ",", twin_of(&prefix)), parser)
-    //   }
-    //   Shape::List => todo!(),
-    //   Shape::Record => todo!(),
-    //   Shape::Closure => todo!(),
-    //   Shape::Holder => todo!(),
-    //   Shape::Empty => todo!(),
-    //   Shape::Unknown | _ => todo!(),
-    // };
-
-    // let (name, shape, inner, deep) = if token.is_left_punct() {
-    //   let mut pram = None;
-    //   let wrapped = self.delimited(
-    //     (&token.to_string(), ",", twin_of(&token.to_string())),
-    //     &mut |p: &mut Parser| {
-    //       let tok = p.peek();
-    //       if tok.is_left_punct() {
-    //         let mut pr = p.parameter();
-    //         pr.pattern = pram.clone();
-    //         pram = Some(Rc::new(pr.clone()));
-    //         pr.name
-    //       } else {
-    //         p.next()
-    //         // tok
-    //       }
-    //     },
-    //   );
-
-    //   (
-    //     Token::Empty(),
-    //     Shape::from(token.clone()),
-    //     vec![],
-    //     Some(Rc::new(wrapped)),
-    //   )
-    // } else if token.is_identifier() {
-    //   (self.next(), Shape::from(token), vec![], None)
-    // } else {
-    //   (token, Shape::Empty, vec![], None)
-    // };
-    // Parameter {
-    //   name,
-    //   shape,
-    //   inner,
-    //   kind: self.annotation(),
-    //   reqs: vec![],
-    //   pattern: None,
-    // }
   }
 
   // TO BE (RE)DONE!
@@ -759,7 +708,7 @@ impl<'a> Parser<'a> {
         Halt::Unexpected(format!(
           "Unexpected end of input!\n Unable to recover {:?} from token {}.",
           here,
-          self.word()
+          self.peek().literal()
         )),
         self.peek(),
       )

@@ -22,6 +22,22 @@ pub struct Definition {
 }
 
 impl Definition {
+  pub fn new(
+    item: Expr,
+    ranges: Vec<(Expr, Expr)>,
+    fixed: Vec<(Expr, Expr)>,
+    conds: Vec<Expr>,
+  ) -> Self {
+    Self {
+      item,
+      ranges,
+      fixed,
+      conds,
+    }
+  }
+}
+
+impl Definition {
   pub fn get_shape(&self) -> Shape {
     match self.item {
       Expr::Nil => Shape::Empty,
@@ -67,10 +83,25 @@ pub struct Binding {
 pub struct Parameter {
   pub name: Token,
   // for destructuring
+  pub pattern: TokPattern,
   pub shape: Shape,
   pub kind: Vec<Token>,
-  // for when inner has an inner field, nested destructuring, etc
-  pub pattern: TokPattern,
+}
+
+impl Parameter {
+  pub fn new(
+    name: Token,
+    pattern: TokPattern,
+    shape: Shape,
+    kind: Vec<Token>,
+  ) -> Self {
+    Parameter {
+      name,
+      pattern,
+      shape,
+      kind,
+    }
+  }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,7 +138,7 @@ impl Shape {
 
 impl From<Token> for Shape {
   fn from(token: Token) -> Shape {
-    if token.is_identifier() {
+    if matches!(token.clone(), Token::Identifier(..) | Token::Meta(..)) {
       Shape::Atom
     } else {
       match token.clone().to_string().as_str() {
