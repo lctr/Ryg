@@ -3,7 +3,11 @@ use std::rc::Rc;
 use super::environment::Envr;
 
 use crate::{
-  core::{function::RygFn, rygtype::RygType, rygval::RygVal},
+  core::{
+    function::RygFn,
+    rygtype::RygType,
+    rygval::{RygVal, NIL},
+  },
   evaluating::environment::Field,
   parsing::expression::Shape,
   util::{constant::PI, state::Halt, types::Maybe},
@@ -11,13 +15,16 @@ use crate::{
 
 pub fn get_type(args: Vec<RygVal>) -> Maybe<RygVal> {
   if args.len() > 0 {
-    Ok(RygVal::Vector(
-      args
-        .clone()
-        .iter()
-        .map(|arg| arg.type_string().into())
-        .collect::<Vec<_>>(),
-    ))
+    let res = args
+      .clone()
+      .iter()
+      .map(|arg| RygVal::Symbol(arg.type_string()))
+      .collect::<Vec<RygVal>>();
+    if args.len() == 1 {
+      Ok(res.get(0).unwrap().to_owned())
+    } else {
+      Ok(RygVal::Vector(res.to_owned()))
+    }
   } else {
     return Err(Halt::InvalidInput(
       "Expected 1 argument, but was provided none!".to_string(),
@@ -28,9 +35,47 @@ pub fn get_type(args: Vec<RygVal>) -> Maybe<RygVal> {
 pub fn load_core(env: &mut Envr) {
   let type_of = RygFn::new(
     "type'of",
-    (Shape::Unknown, vec![RygType::Unknown]),
-    Some((Shape::Atom, RygType::String)),
+    (Shape::Holder, vec![RygType::Any]),
+    Some((Shape::Atom, RygType::Symbol(String::from("Type")))),
     get_type,
+  );
+
+  let length = RygFn::new(
+    "len'",
+    (Shape::Vector, vec![RygType::Vector(vec![RygType::Any])]),
+    Some((Shape::Atom, RygType::Int)),
+    |args| {
+      match args.len() {
+        1 => {
+          if let Some(rv) = args.get(0) {
+            match rv {
+              RygVal::String(st) | RygVal::Symbol(st) => {
+                Ok(RygVal::from(st.len()))
+              }
+              RygVal::Vector(vs) | RygVal::Tuple(_, vs) => {
+                Ok(RygVal::from(vs.len()))
+              }
+              // RygVal::List(_) => todo!(),
+              RygVal::Lambda(l) => Ok(RygVal::from(l.args.len())),
+              RygVal::Error(h) => Err(*h.clone()),
+              RygVal::Function(rf) => Ok(RygVal::from(rf.meta_in.1.len())),
+              RygVal::Object(rc) => Ok(RygVal::from(rc.map.len())),
+              _ => Err(Halt::InvalidType(format!(
+                "Cannot take the length of {}",
+                rv
+              ))),
+            }
+          } else {
+            Ok(RygVal::from(0))
+          }
+        }
+        _ => {
+          return Err(Halt::InvalidInput(
+            "Expected 1 argument, but was provided none!".to_string(),
+          ));
+        }
+      }
+    },
   );
 
   let print_0 = RygFn::new(
@@ -86,15 +131,15 @@ pub fn load_core(env: &mut Envr) {
     },
   );
 
-  [type_of, print_0, print_ln, to_string]
+  [("nil", NIL)].iter().for_each(|(name, val)| {
+    env.def(String::from(*name), Some(val));
+  });
+
+  [type_of, length, print_0, print_ln, to_string]
     .iter()
     .for_each(|f| {
       env.def(f.clone().name, Some(&RygVal::Function(f.to_owned())));
     });
-  // env.def(type_of.clone().name, Some(&RygVal::Function(type_of)));
-  // env.def(print_0.clone().name, Some(&RygVal::Function(print_0)));
-  // env.def(print_ln.clone().name, Some(&RygVal::Function(print_ln)));
-  // env.def(to_string.clone().name, Some(&RygVal::Function(to_string)));
 }
 
 pub fn load_math(env: &mut Envr) {
