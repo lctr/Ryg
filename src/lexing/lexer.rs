@@ -42,8 +42,6 @@ impl<'a> Streaming<Token> for Lexer<'a> {
   }
 }
 
-pub trait Words {}
-
 #[allow(unused)]
 impl<'a> Lexer<'a> {
   pub fn new(src: &str) -> Lexer {
@@ -75,15 +73,10 @@ impl<'a> Lexer<'a> {
         }
         x if is_digit(*x) => self.number(),
         x if starts_name(*x) => self.variable(),
-        x if is_punct(*x) => Token::Punct(
-          {
-            self.src.next();
-            *x
-          },
-          pos,
-        ),
+        x if is_punct(*x) => self.punct(*c, pos),
         x if is_op_char(*x) => {
-          Token::Operator(self.eat_while(is_op_char), pos)
+          self.operator(*x, pos)
+          // Token::Operator(self.eat_while(is_op_char), pos)
         }
         _ => Token::Invalid(
           format!("Unable to recognize character {:?}", &ch),
@@ -92,6 +85,59 @@ impl<'a> Lexer<'a> {
       }
     } else {
       Token::Invalid(format!("No more characters were found"), pos)
+    }
+  }
+
+  fn punct(&mut self, ch: char, pos: Pos) -> Token {
+    self.src.next();
+    let p = self.get_pos();
+    if let Some('|') = self.src.peek() {
+      self.queue.push(Token::Punct('|', p));
+      self.src.next();
+    };
+    Token::Punct(ch, pos)
+  }
+
+  fn operator(&mut self, ch: char, pos: Pos) -> Token {
+    let op = self.eat_while(is_op_char);
+    // let mut vert = false;
+    // let mut v_count = 0;
+    // self.eat_while(|c| {
+    //   (if c == '|' {
+    //     vert = true; v_count += 1; v_count < 2
+    //   } else { if vert { false } else { true  }}) && is_op_char(c)
+    // });
+    match op.as_str() {
+      "|" => match self.src.peek() {
+        Some(pt) if is_punct(pt) => {
+          let pos2 = self.get_pos();
+          // self.queue.push(Token::Punct(pt, pos2));
+          // self.src.next();
+          Token::Punct('|', pos)
+        }
+        _ => Token::Operator(op, pos),
+      },
+      wrd @ ("||:" | "||.") => {
+        // common: || is first
+        let rop = wrd.chars().nth(2).unwrap();
+        let p2 = self.get_pos();
+        self.queue.push(Token::Punct('|', p2.clone()));
+        self.queue.push(Token::Operator(rop.to_string(), {
+          let mut p = p2;
+          p.next(&rop);
+          p
+        }));
+        Token::Punct('|', pos)
+      }
+      wrd @ ("|:" | "|.") => {
+        // common: | is first
+        let rop = wrd.chars().nth(wrd.len() - 1).unwrap();
+        // fix pos later
+        let p2 = self.get_pos();
+        self.queue.push(Token::Operator(rop.to_string(), p2));
+        Token::Punct('|', pos)
+      }
+      _ => Token::Operator(op, pos),
     }
   }
 
@@ -197,6 +243,7 @@ impl<'a> Lexer<'a> {
               word.push_str(format!("\\\\{}", c).as_str());
               // word.push(c);
             }
+            // TODO: parsing unicode escapes
             // 'u' => unicode(self).1 as ,
             '\\' => {
               word.push('\\');
@@ -328,9 +375,7 @@ pub fn is_name(word: &String) -> bool {
 }
 
 pub fn is_digit(c: char) -> bool {
-  // matches!(c, '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '0')
   matches!(c, '0'..='9')
-  // c.is_digit(36)
 }
 
 pub fn is_punct(c: char) -> bool {
@@ -506,8 +551,14 @@ mod tests {
   }
 
   #[test]
+  fn puncts() {
+    let src = "|| 3";
+    inspect_tokens(src);
+  }
+
+  #[test]
   fn from_to() {
-    let src = "3...14";
+    let src = "3..14";
     inspect_tokens(src);
     let mut lexer = Lexer::new(src);
     assert_eq!(
