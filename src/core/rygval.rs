@@ -9,7 +9,11 @@ use crate::{
   evaluating::environment::Field,
   lexing::token::Token,
   parsing::expression::{Parameter, Shape},
-  util::{misc::Paint, state::Halt, types::Maybe},
+  util::{
+    misc::Paint,
+    state::Halt,
+    types::{Either, Maybe},
+  },
 };
 
 use super::{
@@ -35,6 +39,7 @@ pub enum RygVal {
   Float(f64),
   Char(char, Option<char>),
   String(String),
+  Symbol(String),
   Vector(Vec<RygVal>),
   Tuple(usize, Vec<RygVal>),
   List(RygList),
@@ -83,6 +88,12 @@ impl From<u8> for RygVal {
 impl From<i32> for RygVal {
   fn from(item: i32) -> Self {
     RygVal::Int(item)
+  }
+}
+
+impl From<usize> for RygVal {
+  fn from(item: usize) -> Self {
+    RygVal::Int(item as i32)
   }
 }
 
@@ -310,6 +321,21 @@ impl RygVal {
       _ => false,
     }
   }
+  pub fn coerce_nums(
+    ref lhs: RygVal,
+    ref rhs: RygVal,
+  ) -> Maybe<Either<(i32, i32), (f64, f64)>> {
+    match (lhs, rhs) {
+      (RygVal::Int(a), RygVal::Int(b)) => Ok(Either::Left((*a, *b))),
+      (RygVal::Int(a), RygVal::Float(b)) => Ok(Either::Right((*a as f64, *b))),
+      (RygVal::Float(a), RygVal::Int(b)) => Ok(Either::Right((*a, *b as f64))),
+      (RygVal::Float(a), RygVal::Float(b)) => Ok(Either::Right((*a, *b))),
+      _ => Err(Halt::InvalidType(format!(
+        "{} and/or {} is/are not coercible to Num types Int or Float!",
+        lhs, rhs
+      ))),
+    }
+  }
 }
 
 impl PartialEq for RygVal {
@@ -531,11 +557,11 @@ impl Div for RygVal {
         Self::Bool(_) => todo!(),
         Self::Int(i) if self.match_kind(&rhs) => {
           let r = rhs.get_int()?;
-          Ok(if i % r == 0 || r % i == 0 {
-            Self::Int(i / r)
+          if i % r == 0 || r % i == 0 {
+            Ok(Self::Int(i / r))
           } else {
-            Self::Float((i / r).into())
-          })
+            Ok(Self::Float(((i as f64) / (r as f64))))
+          }
         }
         Self::Float(r) => Ok(Self::Float(if r == 0.0 {
           0.0
@@ -748,6 +774,7 @@ impl fmt::Debug for RygVal {
         write!(f, "Char {}{}", if let Some(e) = d { e } else { &'\0' }, c)
       }
       Self::String(s) => write!(f, "String {}", s),
+      Self::Symbol(s) => write!(f, "Symbol {}", s),
       Self::Tuple(_, v) => {
         write!(f, "{}{}{}", blue("("), map_join(v), blue(")"))
       }
@@ -829,6 +856,7 @@ impl fmt::Display for RygVal {
       }
       Self::Char(c, None) => write!(f, "'{}'", c),
       Self::String(s) => write!(f, "{}{}{}", '"', s, '"'),
+      Self::Symbol(s) => write!(f, "{}", s),
       Self::Tuple(_, u) => write!(
         f,
         "{}{}{}",
