@@ -27,6 +27,7 @@ pub enum RecordKey {
   Int(i32),
   Str(String),
   Bool(bool),
+  Sym(String),
 }
 
 impl RecordKey {
@@ -35,6 +36,7 @@ impl RecordKey {
       RygVal::Int(ref n) => Some(RecordKey::Int(n.clone())),
       RygVal::Bool(ref b) => Some(RecordKey::Bool(b.clone())),
       RygVal::String(ref s) => Some(RecordKey::Str(s.clone())),
+      RygVal::Symbol(ref s) => Some(RecordKey::Sym(s.clone())),
       _ => None,
     }
   }
@@ -43,12 +45,13 @@ impl RecordKey {
       Self::Int(n) => RygVal::Int(n.clone()),
       Self::Str(s) => RygVal::String(s.clone()),
       Self::Bool(b) => RygVal::Bool(b.clone()),
+      Self::Sym(b) => RygVal::Symbol(b.clone()),
     }
   }
   pub fn to_string(&self) -> String {
     match self {
       Self::Int(n) => format!("{}", n),
-      Self::Str(s) => s.clone(),
+      Self::Str(s) | Self::Sym(s) => s.clone(),
       Self::Bool(b) => format!("{}", b),
     }
   }
@@ -105,7 +108,7 @@ impl std::fmt::Display for RecordKey {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       RecordKey::Int(i) => write!(f, "[{}]", i),
-      RecordKey::Str(s) => write!(f, "{}", s),
+      RecordKey::Str(s) | RecordKey::Sym(s) => write!(f, "{}", s),
       RecordKey::Bool(b) => write!(f, "{}", b),
     }
   }
