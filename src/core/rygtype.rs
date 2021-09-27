@@ -87,6 +87,7 @@ impl From<RygVal> for RygType {
       RygVal::Float(_) => Self::Float,
       RygVal::Char(..) => Self::Char,
       RygVal::String(_) => Self::String,
+      RygVal::Symbol(s) => Self::Symbol(s),
       RygVal::Tuple(_, v) | RygVal::Vector(v) => {
         (if matches!(val, RygVal::Vector(_)) {
           Self::Vector
