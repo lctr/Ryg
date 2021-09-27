@@ -211,13 +211,6 @@ fn walk_loop(
   } {
     value = walk(*body.clone(), &mut scope)?
   }
-
-  // loop {
-  //   match walk(*cond.clone(), &scope)? {
-  //     RygVal::Bool(true) => value = walk_block(body.clone(),
-  // scope.clone())?,     _ => break,
-  //   };
-  // }
   Ok(value)
 }
 
@@ -244,27 +237,114 @@ fn walk_range(
   // }
 }
 
+// bodyless ranges -- numerical ranges
 fn walk_iter(
   x: Box<Expr>,
   t: Option<Box<Expr>>,
-  env: &mut Envr,
+  mut env: &mut Envr,
 ) -> Maybe<RygVal> {
-  // if matches!(x.clone(), Expr::Vector(..) | Expr::Tuple(..) |
-  // Expr::String(..)) {
-
-  // }
-  match walk(*x.clone(), env) {
-    Ok(r) => match r {
-      RygVal::String(s) => Ok(RygVal::Vector(
-        s.split("")
-          .map(|c| RygVal::String(c.to_owned()))
-          .collect::<Vec<_>>(),
-      )),
-      RygVal::Vector(v) => Ok(RygVal::Vector(v)),
-      _ => Err(RygType::invalid_type(&walk(*x, env)?, "Iter")),
-    },
-    Err(e) => Err(e),
+  let lower_val = walk(*x, &mut env);
+  match (lower_val.clone(), t.clone()) {
+    (Ok(low_val), Some(hi_val)) => {
+      let rval = walk(*hi_val, &mut env);
+      let (i0, j0) = match RygVal::coerce_nums(low_val, rval?)? {
+        Either::Left(x) => x,
+        Either::Right(y) => (y.0.floor() as i32, y.1.floor() as i32),
+      };
+      let rng = (i0..j0)
+        .into_iter()
+        .map(|n| RygVal::from(n))
+        .collect::<Vec<_>>();
+      return Ok(RygVal::Vector(rng));
+    }
+    (Ok(low_val), None) => {
+      let start: Maybe<i32> = match low_val {
+        RygVal::Int(n) => Ok(n),
+        RygVal::Float(n) => Ok(n.floor() as i32),
+        _ => {
+          return Err(Halt::InvalidType(format!(
+            "{} is not a valid range start point!",
+            low_val
+          )))
+        }
+      };
+      if let Ok(idx) = start {
+        let rng = (idx..)
+          .into_iter()
+          .map(|i| RygVal::Int(i))
+          .collect::<Vec<_>>();
+        return Ok(RygVal::Vector(rng));
+      } else {
+        return Err(Halt::InvalidType(format!(
+          "{:?} is not a valid range start point!",
+          start
+        )));
+      }
+    }
+    (_, Some(hi_val)) => {
+      let rval = walk(*hi_val.clone(), &mut env);
+      let end: Maybe<i32> = match rval {
+        Ok(RygVal::Int(i)) => Ok(i),
+        Ok(RygVal::Float(j)) => Ok(j.floor() as i32),
+        Err(h) => return Err(h),
+        _ => {
+          return Err(Halt::InvalidType(format!(
+            "{} is not a valid range end point!",
+            hi_val
+          )))
+        }
+      };
+      if let Ok(fin) = end {
+        let rng = (0..)
+          .into_iter()
+          .take(fin as usize)
+          .map(|n| RygVal::Int(n))
+          .collect::<Vec<_>>();
+        return Ok(RygVal::Vector(rng));
+      } else {
+        return Err(Halt::InvalidType(format!(
+          "{} is not a valid range end point!",
+          hi_val
+        )));
+      }
+    }
+    (_, None) => {
+      todo!()
+    }
   }
+  // let upper_val = if let Some(lst) = t {
+  //   let upper_bound = walk(*lst, &mut env);
+
+  //   match (lower_val, upper_bound) {
+  //     (Ok(low), Ok(high)) => {}
+  //     (Ok(low), Err(h)) => return Err(h),
+  //     (Err(_), Ok(high)) => {}
+  //     (Err(_), Err(_)) => {}
+  //   };
+
+  //   if let (Ok(low), Ok(high)) = (lower_val, upper_bound) {
+  //     if let Ok(pair) = RygVal::coerce_nums(low, high) {
+  //       match pair {
+  //         Either::Left((i, j)) => {
+  //           let mut base = vec![];
+  //           return Ok(RygVal::from(
+  //             (i..j).map(RygVal::from).collect::<Vec<_>>(),
+  //           ));
+  //         }
+  //         Either::Right((i, j)) => {
+  //           let mut base = vec![];
+  //           let (i1, j1) = (i.floor() as i32, j.floor() as i32);
+  //           return Ok(RygVal::from(
+  //             (i1..j1).map(RygVal::from).collect::<Vec<_>>(),
+  //           ));
+  //         }
+  //       };
+  //     } else {
+  //     }
+  //   };
+  // } else {
+  //   Ok(RygVal::Unit())
+  // };
 }
 
 fn walk_index(
@@ -446,10 +526,10 @@ fn walk_list(defn: Definition, env: &mut Envr) -> Maybe<RygVal> {
   )))
 }
 
-fn unravel(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
+fn pattern_match(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
   match (pattern, rygval.clone()) {
     (TokPattern::Empty, _) => {
-      RygVal::Nil();
+      RygVal::Nil(); // throw error?
     }
     (TokPattern::Atom(tok), _) => {
       scope.def(tok.literal(), Some(&rygval));
@@ -458,7 +538,8 @@ fn unravel(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
     | (TokPattern::Vector(vt), RygVal::Vector(rhs)) => vt
       .iter()
       .zip(rhs.iter())
-      .for_each(|(pat, val)| match (pat, val) {
+      .enumerate()
+      .for_each(|(i, (pat, val))| match (pat, val) {
         (TokPattern::Atom(x), _) => {
           &scope.def(x.literal(), Some(&val));
         }
@@ -468,14 +549,34 @@ fn unravel(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
             if let TokPattern::Atom(tt) = a {
               scope.def(tt.literal(), Some(&b));
             } else {
-              unravel(a.to_owned(), b.to_owned(), &mut scope)
+              pattern_match(a.to_owned(), b.to_owned(), &mut scope);
             };
           });
         }
-        (TokPattern::Record(_), _) => todo!(),
+        (TokPattern::Record(obj), RygVal::Object(record)) => {
+          obj.iter().for_each(|tp| {
+            pattern_match(
+              tp.to_owned(),
+              RygVal::Object(record.to_owned()),
+              &mut scope,
+            )
+          });
+        }
         _ => todo!(),
       }),
-    (TokPattern::Record(vt), RygVal::Object(rhs)) => todo!(),
+    (TokPattern::Record(vt), RygVal::Object(rhs)) => {
+      for pat in vt {
+        if let TokPattern::Atom(tk) = pat {
+          [RygVal::String, RygVal::Symbol].iter().for_each(|tok| {
+            if let Some(key) = RecordKey::new(&tok(tk.literal())) {
+              if let Some(vv) = rhs.get(&key) {
+                scope.def(tk.literal(), Some(vv));
+              }
+            }
+          });
+        }
+      }
+    }
     _ => todo!(),
   };
 }
@@ -502,17 +603,7 @@ fn walk_let<'a, 'b: 'a>(
         }
         (Shape::Vector, RygVal::Vector(v))
         | (Shape::Tuple, RygVal::Tuple(_, v)) => {
-          unravel(pattern, rval, scope)
-          // do something about flagging mistakes later
-          // let i_ = inner
-          //   .iter()
-          //   .zip(v.iter())
-          //   .map(|(t, r)| {
-          //     insertions.push(scope.def(t.literal(), Some(r)));
-          //     r
-          //   })
-          //   .collect::<Vec<_>>();
-          // // println!("{:?}\n\ninsertions: {:?}", i_, insertions);
+          pattern_match(pattern, rval, scope)
         }
         (..) => {
           scope.def(name.literal(), Some(&rval));
@@ -630,12 +721,12 @@ fn walk_lambda(
 }
 
 fn walk_binary(
-  o: Token,
-  l: Box<Expr>,
-  r: Box<Expr>,
+  op: Token,
+  left: Box<Expr>,
+  right: Box<Expr>,
   env: &mut Envr,
 ) -> Maybe<RygVal> {
-  apply_op(o, walk(*l, env)?, walk(*r, env)?)
+  apply_op(op, walk(*left, env)?, walk(*right, env)?)
 }
 
 fn apply_conc(left: RygVal, right: RygVal) -> Maybe<RygVal> {
@@ -682,6 +773,8 @@ fn apply_op(operator: Token, left: RygVal, right: RygVal) -> Maybe<RygVal> {
       "*" => left * right,
       "%" => left % right,
       "/" => left / right,
+      "||" => Ok(RygVal::Bool(left.get_bool()? || right.get_bool()?)),
+      "&&" => Ok(RygVal::Bool(left.get_bool()? || right.get_bool()?)),
       "<" => Ok(RygVal::Bool(left < right)),
       ">" => Ok(RygVal::Bool(left > right)),
       "==" => Ok(RygVal::Bool(left == right)),
