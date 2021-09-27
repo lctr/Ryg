@@ -1,28 +1,51 @@
+use std::{ptr::NonNull, rc::Rc};
+
 use crate::{
-  lexing::{
-    lexer::Lexer,
-    token::{Pos, Streaming, Token},
+  lexing::{lexer::Lexer, token::Token},
+  parsing::expression::{Binding, Definition},
+  util::{
+    state::{Halt, Pos, StreamState, Streaming},
+    types::{Either, Kind, Maybe},
   },
-  parsing::expression::Expr,
 };
 
+use super::expression::{Expr, Parameter, Shape, TokPattern};
+
+pub struct Parsed<'a, T>(&'a T);
+
+#[derive(Debug)]
 pub struct Parser<'a> {
   lexer: Lexer<'a>,
+  state: StreamState<Token>,
+  parsed: Vec<Expr>,
 }
 
 impl<'a> Streaming<Token> for Parser<'a> {
   fn peek(&mut self) -> Token {
+    // println!("peek: {:?}", &self.lexer.peek());
     self.lexer.peek()
   }
 
   fn next(&mut self) -> Token {
-    self.lexer.next()
+    if let StreamState::Halted(a) = &self.state {
+      return a.clone();
+    };
+    let next = self.lexer.next();
+    // println!("before next: {:?}", &next);
+    if let Token::Invalid(..) = &next {
+      self.state = StreamState::Halted(next.clone());
+      next
+    } else {
+      next
+    }
   }
 
-  fn eof(&mut self) -> bool {
-    self.peek().match_literal("\0")
-      || self.lexer.eof()
-      || self.peek() == Token::Eof()
+  fn done(&mut self) -> bool {
+    self.peek().is_eof() || self.state.is_complete()
+  }
+
+  fn get_pos(&mut self) -> Pos {
+    self.lexer.get_pos()
   }
 }
 
@@ -31,38 +54,57 @@ impl<'a> Parser<'a> {
   pub fn new(src: &str) -> Parser {
     Parser {
       lexer: Lexer::new(src),
+      state: StreamState::new(None),
+      parsed: vec![],
     }
   }
 
-  pub fn get_pos(&mut self) -> Pos {
-    self.lexer.get_pos()
-  }
-  pub fn eat(&mut self, literal: &str) {
-    if self.peek().literal() == literal {
-      self.next();
+  pub fn eat(&mut self, literal: &str) -> Maybe<Token> {
+    if !self.state.is_halted() && self.word() == literal {
+      Ok(self.next())
     } else {
-      panic!(
-        "Expected {:?}, but instead found {:?} at {:?}",
+      let p = self.get_pos();
+      let halt = Halt::Unexpected(format!(
+        "Expected '{}', but instead found '{}' {:?}",
         literal,
-        self.peek().literal(),
-        self.get_pos()
-      )
+        self.word(),
+        p
+      ));
+      panic!("{}", halt)
     }
   }
+
   pub fn ignore(&mut self, literal: &str) {
     if self.match_literal(literal) {
-      self.eat(literal)
+      self.eat(literal);
     }
   }
+
   pub fn word(&mut self) -> String {
     self.peek().literal()
   }
 
-  fn match_literal(&mut self, s: &str) -> bool {
+  pub fn match_literal(&mut self, s: &str) -> bool {
     self.peek().match_literal(s)
   }
+
   pub fn match_any_of(&mut self, literals: &[&str]) -> bool {
     literals.contains(&self.word().as_str())
+  }
+
+  pub fn maybe_delimited<K, F: FnMut(&mut Self) -> K>(
+    &mut self,
+    sep: Option<&str>,
+    mut parser: F,
+  ) -> Either<K, Vec<K>> {
+    let token = self.peek();
+    let infix = sep.unwrap_or(",");
+    if let Token::Punct(c @ ('(' | '[' | '{'), _) = token {
+      let c = &c.to_string();
+      Either::Right(self.delimited((c, infix, twin_of(c)), &mut parser))
+    } else {
+      Either::Left(parser(self))
+    }
   }
 
   pub fn delimited<K, F: FnMut(&mut Self) -> K>(
@@ -73,7 +115,7 @@ impl<'a> Parser<'a> {
     let mut nodes: Vec<K> = vec![];
     self.eat(prefix);
     let mut first = true;
-    while !self.eof() {
+    while !self.done() {
       if self.match_literal(suffix) {
         break;
       };
@@ -93,29 +135,104 @@ impl<'a> Parser<'a> {
 
   pub fn parse(&mut self) -> Expr {
     let mut body: Vec<Expr> = vec![];
-    while !self.eof() {
-      body.push(self.expression());
-      if !self.lexer.eof() {
-        self.eat(";");
-      }
+    while !self.done() {
+      let expr = self.expression();
+      if let Expr::Error(h, t) = expr {
+        panic!("{}; token: {}", h, t);
+      } else {
+        body.push(expr);
+        self.ignore(";");
+      };
     }
     Expr::Block(body)
   }
 
   pub fn expression(&mut self) -> Expr {
-    self.callish(Parser::groupish)
+    let expr = self.maybe_call(Parser::maybe_binary);
+    self.parsed.push(expr.clone());
+    expr
   }
+
+  pub fn maybe_call<F: FnMut(&mut Self) -> Expr>(
+    &mut self,
+    mut parser: F,
+  ) -> Expr {
+    let expr = parser(self);
+    let mut token = self.peek();
+    if token.match_literal("(") {
+      self.call(expr)
+    } else {
+      expr
+    }
+  }
+
+  pub fn call(&mut self, expr: Expr) -> Expr {
+    Expr::Call(
+      Box::new(expr.clone()),
+      self.delimited(("(", ",", ")"), &mut Parser::expression),
+      None,
+    )
+  }
+
   pub fn atom(&mut self) -> Expr {
-    self.callish(Parser::terminal)
+    self.maybe_call(Parser::terminal)
   }
-  pub fn groupish(&mut self) -> Expr {
-    self.group(Parser::atom)
+
+  pub fn maybe_binary(&mut self) -> Expr {
+    // self.group(&mut Parser::atom)
+    self.operator_assoc_l(Self::atom, 0)
   }
-  pub fn group<F: FnMut(&mut Self) -> Expr>(&mut self, mut parser: F) -> Expr {
-    let token = self.peek();
-    match token {
-      Token::Operator(_) => parser(self),
-      _ => self.callish(Parser::assign),
+
+  fn maybe_unary(
+    &mut self,
+    token: Token,
+    mut left: Option<Expr>,
+    (this_prec, that_prec): (usize, usize),
+  ) -> Expr {
+    if let Some(expr) = left {
+      self.operator_assoc_l(
+        |p: &mut Parser| {
+          (if token.match_any_of(&["=", "<-", "=<"]) {
+            Expr::Assign
+          } else {
+            Expr::Binary
+          })(
+            token.clone(),
+            Box::new(expr.clone()),
+            Box::new(p.operator_assoc_l(Self::atom, that_prec)),
+          )
+        },
+        this_prec,
+      )
+    } else {
+      Expr::Unary(token, Box::new(self.atom()))
+    }
+  }
+
+  pub fn operator_assoc_l<F: FnMut(&mut Self) -> Expr>(
+    &mut self,
+    mut parselet: F,
+    this_prec: usize,
+  ) -> Expr {
+    let mut left = parselet(self);
+    let mut token = self.peek();
+    match token.clone() {
+      x if x.as_operator().is_none() => left,
+      Token::Operator(..) => {
+        if let Some(that_prec) = token.clone().precedence() {
+          if (this_prec < that_prec) {
+            self.next();
+            left = self.maybe_unary(
+              token.clone(),
+              Some(left.clone()),
+              (this_prec, that_prec),
+            )
+          };
+          token = self.peek();
+        };
+        left
+      }
+      _ => left,
     }
   }
 
@@ -133,58 +250,79 @@ impl<'a> Parser<'a> {
     Expr::Conditional(Box::new(cond), Box::new(then), deft)
   }
 
+  pub fn function(&mut self) -> Expr {
+    self.eat("fn");
+    let name = if let Token::Identifier(n, _) = self.next() {
+      n
+    } else {
+      let token = self.peek();
+      self.unknown(
+        format!(
+          "Expected a name for the function definition, but instead found {}",
+          token
+        ),
+        Some("|"),
+      );
+      return self.lambda();
+    };
+    match if self.peek().match_literal("|") {
+      self.lambda()
+    } else {
+      self.expression()
+    } {
+      Expr::Lambda(_, b, c) => Expr::Lambda(Some(name), b, c),
+      lambda => lambda,
+    }
+  }
+
   pub fn lambda(&mut self) -> Expr {
-    let token = self.peek();
-    let name = if let Token::Identifier(t) = token {
+    let name = if let Token::Identifier(t, _) = self.peek() {
       Some(t)
     } else {
       None
     };
-
-    let prams = self.delimited(("|", ",", "|"), &mut |p| {
-      let wrd = p.word();
-      p.next();
-      wrd
-    });
-
-    let body = if self.match_literal("{") {
-      self.block()
+    let prams = if self.match_literal("||") {
+      self.next();
+      vec![]
     } else {
-      self.expression()
+      self.delimited(("|", ",", "|"), &mut Self::parameter)
     };
-
+    let body = self.maybe_block();
     Expr::Lambda(name, prams, Box::new(body))
   }
 
-  pub fn block(&mut self) -> Expr {
-    let mut body = self.delimited(("{", ";", "}"), &mut |p| p.expression());
-
-    match body.len() {
-      0 => Expr::Literal(Token::Boolean("false".to_string())),
-      1 => match body.get(0) {
-        Some(b) => b.to_owned(), //body.pop().unwrap(),
-        None => panic!("what"),
-      },
-      _ => Expr::Block(body),
-    }
-  }
-
-  pub fn callish<F: FnMut(&mut Self) -> Expr>(
-    &mut self,
-    mut parser: F,
-  ) -> Expr {
-    let expr = parser(self);
-    let mut token = self.peek();
-    if token.match_literal("(") {
-      self.call(expr)
+  fn maybe_block(&mut self) -> Expr {
+    if self.match_literal("{") {
+      self.block()
     } else {
-      expr
+      self.expression()
     }
   }
 
-  pub fn call(&mut self, expr: Expr) -> Expr {
-    let args = self.delimited(("(", ",", ")"), &mut |p| p.expression());
-    Expr::Call(Box::new(expr), args)
+  pub fn block(&mut self) -> Expr {
+    self.ignore("do");
+    let body = self.delimited(("{", ";", "}"), &mut Self::expression);
+    match body.len() {
+      0 => Expr::Nil,
+      1 => match body.get(0) {
+        Some(b) => b.to_owned(),
+        None => Expr::Nil,
+      },
+      _ => Expr::Block(body.to_owned()),
+    }
+  }
+
+  pub fn record(&mut self) -> Expr {
+    self.eat("#");
+    let name =
+      if matches!(self.peek(), Token::Identifier(..) | Token::Meta(..)) {
+        Kind(self.next())
+      } else {
+        Kind(Token::Empty())
+      };
+    let body =
+      self.delimited(("{", ",", "}"), &mut |p: &mut Parser| p.binding("->"));
+    Expr::Record(name, body)
   }
 
   pub fn case(&mut self) -> Expr {
@@ -195,14 +333,14 @@ impl<'a> Parser<'a> {
     let mut deft: Expr = Expr::Literal(Token::Empty());
     let mut conds = vec![];
     let mut token = self.peek();
-    while !token.match_literal("}") {
-      let pattern = self.expression();
+    while !(self.done() || token.match_literal("}")) {
+      let pattern = self.binary(
+        &mut |p: &mut Self| p.binary(Self::expression, &["|"]),
+        &["->", "@"],
+      );
+      println!("{:?}", &pattern);
       self.eat("=>");
-      let branch = if self.match_literal("{") {
-        self.block()
-      } else {
-        self.expression()
-      };
+      let branch = self.maybe_block();
       self.ignore(",");
       if token.match_literal("_") {
         deft = branch.clone();
@@ -217,74 +355,34 @@ impl<'a> Parser<'a> {
 
   pub fn binary<F: FnMut(&mut Self) -> Expr>(
     &mut self,
-    mut parser: F,
+    mut parselet: F,
     ops: &[&str],
   ) -> Expr {
-    let mut left = parser(self);
+    let mut left = parselet(self);
     let mut token = self.peek();
-    let eqs = ["=", ":=", "<-", "=:", "=<"];
-    while ops.contains(&token.literal().as_str()) {
+    let eqs = ["=", "<-"];
+    while token.match_any_of(ops) {
       self.next();
       left = if eqs.contains(&token.literal().as_str()) {
-        Expr::Assign(token, Box::new(left), Box::new(parser(self)))
+        Expr::Assign
       } else {
-        Expr::Binary(token, Box::new(left), Box::new(parser(self)))
-      };
+        Expr::Binary
+      }(token, Box::new(left), Box::new(parselet(self)));
       token = self.peek();
     }
     left
   }
 
-  pub fn assign(&mut self) -> Expr {
-    // self.bin_op()
-    self.binary(Parser::bind, &["=", "<-"])
-  }
-  pub fn bind(&mut self) -> Expr {
-    self.binary(Parser::or, &["=<"])
-  }
-  pub fn or(&mut self) -> Expr {
-    self.binary(Parser::and, &["||"])
-  }
-  pub fn and(&mut self) -> Expr {
-    self.binary(Parser::bit_or, &["&&"])
-  }
-  pub fn bit_or(&mut self) -> Expr {
-    self.binary(|p| p.xor(), &["|"])
-  }
-  pub fn xor(&mut self) -> Expr {
-    self.binary(Parser::bit_and, &["^"])
-  }
-  pub fn bit_and(&mut self) -> Expr {
-    self.binary(Parser::equality, &["&"])
-  }
-  pub fn equality(&mut self) -> Expr {
-    self.binary(Parser::comparison, &["==", "!="])
-  }
-  pub fn comparison(&mut self) -> Expr {
-    self.binary(Parser::conc, &["<", ">", "<=", ">="])
-  }
-  pub fn conc(&mut self) -> Expr {
-    self.binary(Parser::term, &["<>", "++"])
-  }
-  pub fn term(&mut self) -> Expr {
-    self.binary(Parser::factor, &["+", "-"])
-  }
-  pub fn factor(&mut self) -> Expr {
-    self.binary(Parser::unary, &["*", "/", "%"])
-  }
   pub fn unary(&mut self) -> Expr {
-    let mut token = self.peek();
-    if token.match_literal("!") || token.match_literal("-") {
-      self.next();
-      let right = self.atom();
-      Expr::Unary(token, Box::new(right))
+    if self.match_any_of(&["!", "-"]) {
+      let mut op = self.next();
+      let right = self.unary();
+      Expr::Unary(op, Box::new(right))
     } else {
-      self.binary(|p| p.exponent(), &["**"])
+      self.atom()
     }
   }
-  pub fn exponent(&mut self) -> Expr {
-    self.binary(|p| p.atom(), &["**"])
-  }
+
   pub fn indexish<F: FnMut(&mut Self) -> Expr>(
     &mut self,
     mut parser: F,
@@ -296,12 +394,26 @@ impl<'a> Parser<'a> {
       body
     }
   }
+
+  pub fn eat_match<K, F: FnMut(&mut Self, bool) -> K>(
+    &mut self,
+    literal: &str,
+    parser: &mut F,
+  ) -> K {
+    if self.match_literal(literal) {
+      self.eat(literal);
+      parser(self, true)
+    } else {
+      parser(self, false)
+    }
+  }
+
   pub fn index(&mut self, body: Expr) -> Expr {
     self.eat("[");
     if self.match_literal("..") {
       self.eat("..");
       self.eat("]");
-      Expr::Iter(Box::new(body))
+      Expr::Iter(Box::new(body), None)
     } else {
       self.indexish(|p| {
         let idx = p.expression();
@@ -314,163 +426,350 @@ impl<'a> Parser<'a> {
               Box::new(idx),
               None,
             );
+          } else {
+            let end = p.expression();
+            p.eat("]");
+            return Expr::Range(
+              Box::new(body.to_owned()),
+              Box::new(idx),
+              Some(Box::new(end)),
+            );
           }
-          let end = p.expression();
-          p.eat("]");
-          return Expr::Range(
-            Box::new(body.to_owned()),
-            Box::new(idx),
-            Some(Box::new(end)),
-          );
         }
         p.eat("]");
         Expr::Index(Box::new(body.to_owned()), Box::new(idx))
       })
     }
   }
+
+  fn twice<E, F: FnMut(&mut Self) -> E>(
+    &mut self,
+    ref mut parser: F,
+  ) -> (E, E) {
+    (parser(self), parser(self))
+  }
+
+  pub fn looping(&mut self) -> Expr {
+    self.eat("loop");
+    let (cond, body) = self.twice(|p| Box::new(p.maybe_block()));
+    Expr::Loop(cond, body)
+  }
+
+  pub fn maybe_tuple(&mut self) -> Expr {
+    let expr = if self.match_literal(")") {
+      self.next();
+      return Expr::Nil;
+    } else {
+      self.expression()
+    };
+    match self.peek() {
+      Token::Punct(',', _) => {
+        let mut rest =
+          self.delimited((",", ",", ")"), &mut Parser::expression);
+        rest.insert(0, expr);
+        Expr::Tuple(rest)
+      }
+      Token::Punct(')', _) => {
+        self.eat(")");
+        expr
+      }
+      Token::Operator(x, _) if matches!(x.as_str(), "!" | "-") => {
+        Expr::Unary(self.next(), Box::new(self.unary()))
+      }
+      k => panic!("Idk how to handle {:?}", k),
+    }
+  }
+
+  pub fn list_comprehension(&mut self, head: Expr) -> Expr {
+    let mut ranges = vec![];
+    let mut fixed = vec![];
+    let mut conds = vec![];
+    let rhs = self.delimited(("|", ",", "]"), &mut |p| {
+      let expr = p.expression();
+      if let Expr::Assign(op, b, c) = expr {
+        match op.literal().as_str() {
+          "<-" => ranges.push((*b, *c)),
+          "=" => fixed.push((*b, *c)),
+          _ =>
+          /* TODO */
+          {
+            panic!("{:?}", p.peek())
+          }
+        };
+      } else {
+        conds.push(expr)
+      }
+    });
+    return Expr::List(Box::new(Definition {
+      item: head,
+      ranges,
+      fixed,
+      conds,
+    }));
+  }
+
+  pub fn maybe_list(&mut self) -> Expr {
+    self.eat("[");
+    let item = if self.match_literal("[") {
+      self.maybe_list()
+    } else {
+      self.atom()
+    };
+    if self.match_literal("|") {
+      self.list_comprehension(item)
+    } else if self.match_literal(",") {
+      let mut expr = self.delimited((",", ",", "]"), &mut Self::expression);
+      expr.insert(0, item);
+      self.indexish(|_| Expr::Vector(expr.to_owned()))
+    } else if self.match_literal("]") {
+      self.eat("]");
+      self.indexish(|_| Expr::Vector(vec![item.to_owned()]))
+    } else {
+      // it is an error to get here! list brackets not closed out
+      let pos = self.get_pos();
+      self.unknown(
+        format!("Unable to find closing square bracket {:?}", pos),
+        Some("]"),
+      )
+    }
+  }
   pub fn terminal(&mut self) -> Expr {
     let token = self.peek();
+    let pos = self.get_pos();
     match token {
-      Token::Punct('(') => {
+      Token::Punct('(', _) => {
         self.next();
-        let expr = self.expression();
-        if let Token::Punct(',') = self.peek() {
-          let mut rest =
-            self.delimited((",", ",", ")"), &mut Parser::expression);
-          rest.insert(0, expr);
-          Expr::Tuple(rest)
-        } else {
-          self.eat(")");
-          expr
-        }
+        self.maybe_tuple()
       }
-      Token::Punct('{') => self.block(),
-      Token::Punct('|') => self.lambda(),
-      Token::Operator(x) => match x.as_str() {
-        "!" | "-" => self.unary(),
-        "|" => self.lambda(),
-        _ => {
-          panic!("Unable to parse Operator {:?} at {:?}", x, self.get_pos())
-        }
+      x if x.is_unary() => self.unary(),
+      Token::Punct('{', _) => self.block(),
+      x if x.match_any_of(&["|", "||"]) => return self.lambda(),
+
+      Token::Operator(x, _) => match x.as_str() {
+        "#" => self.record(),
+        _ => self.unknown(
+          format!("Unable to parse Operator {:?} at {:?}", x, pos),
+          Some(";"),
+        ),
       },
-      Token::Keyword(k) => match k.as_str() {
+      Token::Keyword(k, _) => match k.as_str() {
         "if" => self.conditional(),
-        "let" => self.locals(),
+        "let" => self.let_binding(),
         "do" => {
           self.next();
           self.block()
         }
         "case" => self.case(),
-        _ => {
-          panic!("Unable to parse Keyword {} at {:?}", k, self.get_pos())
-        }
+        "loop" => self.looping(),
+        "fn" => self.function(),
+        _ => self.unknown(
+          format!("Unable to parse Keyword {} at {:?}", k, pos),
+          Some(";"),
+        ),
       },
-      Token::Punct('[') => {
-        debug_assert_eq!(self.word(), "[");
-        let expr = self.delimited(("[", ",", "]"), &mut Parser::expression);
-        Expr::Vector(expr)
-      }
-      Token::String(_) | Token::Identifier(_) => {
+      Token::Punct('[', _) => self.maybe_list(),
+      Token::String(..) | Token::Identifier(..) => {
         self.next();
         self.indexish(|_| Expr::Literal(token.to_owned()))
       }
-      Token::Number(_, _) | Token::Symbol(_) | Token::Boolean(_) => {
+      Token::Char(..)
+      | Token::Meta(..)
+      | Token::Number(..)
+      | Token::Symbol(..)
+      | Token::Boolean(..) => {
         self.next();
         Expr::Literal(token)
       }
       _ => {
-        panic!("Unable to parse {:?} at {:?}", token, self.get_pos());
+        let msg = format!("Unable to parse {:?} at {:?}", token, pos);
+        self.unknown(
+          format!("Unable to parse {:?} at {:?}", token, pos),
+          Some(";"),
+        );
+        panic!(msg)
       }
     }
   }
 
-  pub fn variable_expr(ref mut p: &mut Parser, args: Vec<Defn>) {}
-  pub fn locals(&mut self) -> Expr {
-    self.eat("let");
-    self.ignore("{");
-    let mut args = vec![];
-    let stop =
-      &mut |p: &mut Parser| p.match_literal("in") || p.match_literal("}");
-    let mut token = self.peek();
-    while !stop(self) {
-      if let Token::Identifier(_) = token {
-        args.push(self.binding());
-        self.ignore(",");
-        if stop(self) {
-          break;
-        }
-        token = self.peek();
+  pub fn let_binding(&mut self) -> Expr {
+    let args = self.delimited(("let", ",", "in"), &mut |p: &mut Parser| {
+      if matches!(p.peek(), Token::Punct(..) | Token::Identifier(..)) {
+        p.binding("=")
       } else {
         panic!(
           "Expecting a variable name, but instead got {:?} at {:?}",
-          token,
-          self.get_pos()
+          p.peek(),
+          p.get_pos()
         )
       }
-    }
-    self.ignore("}");
-    self.eat("in");
+    });
     Expr::Variable(args, Box::new(self.expression()))
   }
-  fn binding(&mut self) -> Defn {
-    let mut def = None;
-    let mut name = String::new();
-    let mut kind = None;
-    if let Defn::Parameter(n, k, _) = self.parameter() {
-      name = n;
-      kind = k;
+
+  fn binding(&mut self, op_literal: &str) -> Binding {
+    Binding {
+      pram: self.parameter(),
+      expr: self.eat_match(op_literal, &mut |p, b| {
+        if b {
+          p.expression()
+        } else {
+          Expr::Nil
+        }
+      }),
     }
-    if self.match_literal("=") {
-      self.next();
-      def = Some(self.expression());
-    }
-    Defn::Binding(name, def, kind)
   }
-  fn parameter(&mut self) -> Defn {
-    let token = self.peek();
-    let w = token.literal();
-    let mut shape = None;
-    if ["(", "[", "{"].contains(&w.as_str()) {
-      shape = Some((
-        ["_", &w].join(""),
-        self.delimited((&w, ",", complement(&w)), &mut |p| p.parameter()),
-      ))
-    }
-    let name = self.word();
-    let mut kind = String::new();
-    self.next();
-    if [":", "::"].contains(&self.peek().literal().as_str()) {
-      self.next();
-      if let Token::Identifier(v) = self.peek() {
-        kind = v;
-        self.next();
+
+  fn annotation(&mut self) -> Vec<Token> {
+    self.eat_match(":", &mut |p1, b| {
+      if b {
+        match p1.maybe_delimited(Some(","), &mut |p2: &mut Parser| p2.next()) {
+          Either::Left(x) => vec![x],
+          Either::Right(x) => x,
+        }
       } else {
-        panic!(
-          "Expected a type for this type annotation, but instead got {:?} at {:?}",
-          self.peek(),
-          self.get_pos()
-        )
+        vec![]
+      }
+    })
+  }
+
+  fn pattern(&mut self) -> TokPattern {
+    let token = self.peek();
+    if !token.is_left_punct() {
+      TokPattern::Atom(self.next())
+    } else {
+      let prefix = token.literal();
+      let list =
+        self.delimited((&prefix, ",", twin_of(&prefix)), &mut Self::pattern);
+      match prefix.as_str() {
+        "[" => TokPattern::Vector(list),
+        "(" => TokPattern::Tuple(list),
+        "{" => TokPattern::Record(list),
+        _ => TokPattern::Empty,
       }
     }
-    // (name, kind, shape)
-    Defn::Parameter(name, Some(kind), shape)
+  }
+
+  fn parameter(&mut self) -> Parameter {
+    let token = self.peek();
+    let shape = Shape::from(token.clone());
+    let name = if token.clone().is_left_punct() {
+      Token::Empty()
+    } else if token.clone().is_identifier() {
+      self.peek()
+    } else {
+      token.clone()
+    };
+    Parameter {
+      name: name.clone(),
+      pattern: self.pattern(),
+      shape: if name == token && shape != Shape::Atom {
+        Shape::Empty
+      } else {
+        shape
+      },
+      kind: self.annotation(),
+    }
+
+    // match shape {
+    //   Shape::Atom => Parameter {
+    //     name: self.next(),
+    //     kind: self.annotation(),
+    //     shape,
+    //     inner: vec![],
+    //     reqs: vec![],
+    //     pattern: None,
+    //   },
+    //   Shape::Tuple => todo!(),
+    //   Shape::Vector => {
+    //     let prefix = token.literal();
+    //     self.delimited((&prefix, ",", twin_of(&prefix)), parser)
+    //   }
+    //   Shape::List => todo!(),
+    //   Shape::Record => todo!(),
+    //   Shape::Closure => todo!(),
+    //   Shape::Holder => todo!(),
+    //   Shape::Empty => todo!(),
+    //   Shape::Unknown | _ => todo!(),
+    // };
+
+    // let (name, shape, inner, deep) = if token.is_left_punct() {
+    //   let mut pram = None;
+    //   let wrapped = self.delimited(
+    //     (&token.to_string(), ",", twin_of(&token.to_string())),
+    //     &mut |p: &mut Parser| {
+    //       let tok = p.peek();
+    //       if tok.is_left_punct() {
+    //         let mut pr = p.parameter();
+    //         pr.pattern = pram.clone();
+    //         pram = Some(Rc::new(pr.clone()));
+    //         pr.name
+    //       } else {
+    //         p.next()
+    //         // tok
+    //       }
+    //     },
+    //   );
+
+    //   (
+    //     Token::Empty(),
+    //     Shape::from(token.clone()),
+    //     vec![],
+    //     Some(Rc::new(wrapped)),
+    //   )
+    // } else if token.is_identifier() {
+    //   (self.next(), Shape::from(token), vec![], None)
+    // } else {
+    //   (token, Shape::Empty, vec![], None)
+    // };
+    // Parameter {
+    //   name,
+    //   shape,
+    //   inner,
+    //   kind: self.annotation(),
+    //   reqs: vec![],
+    //   pattern: None,
+    // }
+  }
+
+  // TO BE (RE)DONE!
+  pub fn unknown(&mut self, message: String, flag: Option<&str>) -> Expr {
+    let here = (self.peek(), self.get_pos());
+    self.state = StreamState::Halted(Token::Invalid(
+      format!("{}. Token read: {}", message, self.peek()),
+      self.get_pos(),
+    ));
+    let _ = flag.and_then(|word| {
+      while !self.match_literal(word) && !self.lexer.done() {
+        Some(self.next());
+        if self.match_literal(word) {
+          self.state = StreamState::Halted(Token::Invalid(
+            format!("{}. Token read: {}", message, self.peek()),
+            self.get_pos(),
+          ));
+        };
+      }
+      return Some(self.peek());
+    });
+    if self.done()
+      || self.lexer.done()
+      || self.state.is_complete()
+      || self.state.is_halted()
+    {
+      Expr::Error(
+        Halt::Unexpected(format!(
+          "Unexpected end of input!\n Unable to recover {:?} from token {}.",
+          here,
+          self.word()
+        )),
+        self.peek(),
+      )
+    } else {
+      self.expression()
+    }
   }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Defn {
-  Def(Option<Expr>),
-  Name(String),
-  // type
-  Kind(Option<String>),
-  // for destructuring
-  Shape(Option<Vec<Defn>>),
-  Argmnts(Expr, Option<Vec<Defn>>),
-  Binding(String, Option<Expr>, Option<String>),
-  Parameter(String, Option<String>, Option<(String, Vec<Defn>)>),
-}
-
-fn complement(s: &str) -> &str {
+fn twin_of(s: &str) -> &str {
   match s {
     "(" => ")",
     ")" => "(",
@@ -491,46 +790,21 @@ fn complement(s: &str) -> &str {
   }
 }
 
-/* POTENTIAL REFACTORING OF BIN_OP CHAIN
- * DOES NOT TAKE UNARIES INTO ACCOUNT!!
- *   pub fn bin_op(&mut self) -> Expr {
- *     vec![
- *       vec!["=", "<-"],
- *       vec!["||"],
- *       vec!["&&"],
- *       vec!["|"],
- *       vec!["^"],
- *       vec!["&"],
- *       vec!["==", "!="],
- *       vec!["<", ">", "<=", ">="],
- *       vec!["<>", "++"],
- *       vec!["+", "-"],
- *       vec!["*", "/", "%"],
- *     ]
- *     .iter()
- *     .rev()
- *     .fold(self.binary(|p| p.atom(), vec!["**"]), &mut
- * |acc: Expr,
- * x: &Vec<       &str,
- *     >| {
- *       self.binary(|_| acc.clone(), x.to_vec())
- *     })
- *   }
- */
-
-pub fn get_ast(src: &str) -> Expr {
+pub fn parse_input(src: &str) -> Expr {
   let mut p = Parser::new(src);
   p.parse()
 }
 
 #[cfg(test)]
 mod tests {
+  use crate::log_do;
+
   use super::*;
   fn inspect_tokens(src: &str) {
     let mut parser = Parser::new(src);
     let mut i = 0;
     println!("source: {:?}", src);
-    while !parser.eof() {
+    while !parser.done() {
       i += 1;
       println!("[{}] {:?}", i, parser.next());
     }
@@ -538,16 +812,35 @@ mod tests {
   }
   fn parse(src: &str) {
     let mut parser = Parser::new(src);
-    println!("source: {}", src);
+    println!("source: {:?}", src);
     let ast = parser.parse();
     println!("{:#?}", ast)
   }
 
+  fn inspect_expr(src: &str) {
+    let mut parser = Parser::new(src);
+    let mut i = 0;
+    println!("source: {:?}", src);
+    while !parser.done() && !parser.lexer.done() {
+      i += 1;
+      println!("[{}] {:#?}", i, parser.expression());
+    }
+    println!("[{}] {:?}", i + 1, parser.next())
+  }
+
   #[test]
   fn inspect_decimal() {
-    let src = "3.14 + 6";
+    let src = "3.146";
     let mut parser = Parser::new(src);
-    println!("{:#?}", parser.assign())
+    // println!("{:#?}", parser.parse());
+    println!("{:?}", parser.next());
+    println!("{:?}", parser.next());
+  }
+
+  #[test]
+  fn inspect_arithmetic() {
+    let src = "1 + 2 / 3 * (4 ** 5 / 6)";
+    inspect_expr(src)
   }
 
   #[test]
@@ -558,20 +851,64 @@ mod tests {
 
   #[test]
   fn inspect_lambda() {
-    let src = "(|a, b| a + 19)()";
+    let src = "(|a: A, [b, c]: [C, B]| a + 19)()";
     inspect_tokens(src);
     parse(src);
   }
 
   #[test]
-  fn test_tuple() {
-    let src = "(-i,o, 5, 3 + 5/6)"; //"let x = 4 in x + 1;";
+  fn inspect_tuple() {
+    let src = "(-i, @, 5, 3 + 5/6)"; //"let x = 4 in x + 1;";
     parse(src);
+  }
+
+  #[test]
+  fn inspect_record() {
+    let src = "#{a -> b, c -> d};";
+    inspect_tokens(src);
+    parse(src);
+  }
+
+  #[test]
+  fn inspect_loop() {
+    let src = "loop a {b; c; d} + 3"; //"a =< b =< |c| a ** b";
+    parse(src);
+    inspect_expr(src);
   }
 
   #[test]
   fn inspect_let() {
     let src = "let a = 1, b = 2 in a + b == 3;";
-    parse(src)
+    inspect_expr(src);
+    parse("let [a, b] = [1, 2] in a + b")
+  }
+
+  #[test]
+  fn inspect_case() {
+    let src = "case 3 + 5 of { 1 => true, 8 => \"womp\"};";
+    inspect_tokens(src.clone());
+    inspect_expr(src);
+  }
+
+  #[test]
+  fn inspect_list() {
+    let src = "[[(a, b, c)] | a <- [1, b], a + b > 0, c = 3]";
+    inspect_tokens(src.clone());
+    inspect_expr(src);
+  }
+
+  #[test]
+  fn inspect_unary() {
+    let src = "|| 3"; //"-(a) + b - c";
+    let mut parser = Parser::new(src);
+    log_do!(
+      "tok to string" => Token::Identifier(String::from("s34"), Pos::faux()).to_string(),
+     "parser" => &parser,
+    //  "next" => &parser.next(),
+    //  "expression" => &parser.maybe_unary(&mut |p: &mut Parser| p.unary()),
+    //   "next" => &parser.next(),
+    //   "next" => &parser.next(),
+      "expression" => &parser.expression()
+    )
   }
 }
