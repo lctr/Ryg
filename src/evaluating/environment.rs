@@ -1,7 +1,6 @@
 use std::{
-  cell::RefCell,
   collections::HashMap,
-  fmt::{self, Debug},
+  fmt::{self, Debug, Write},
   hash::{Hash, Hasher},
 };
 
@@ -13,92 +12,17 @@ use crate::{
   lexing::token::Token,
   main,
   util::{
-    misc::Paint,
+    display::{Paint, Table},
     state::Halt,
     types::{Either, Kind, Maybe},
   },
 };
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-pub struct Field {
-  pub name: String,
-  pub kind: RygType,
-}
-
-impl fmt::Display for Field {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let [l, m, r] = [
-      Paint::fg_light_red("(".to_string()),
-      Paint::fg_red("::".to_string()),
-      Paint::fg_light_red(")".to_string()),
-    ];
-    write!(
-      f,
-      "{}{:<9.*} {} {:>18.*}{}\n",
-      l,
-      36,
-      m,
-      self.name,
-      36,
-      self.kind.to_string(),
-      r
-    )
-  }
-}
-
-impl fmt::Debug for Field {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "({} :: {})",
-      self.name,
-      self.kind,
-      // " ".repeat(self.name.len())
-    )
-  }
-}
-
-impl From<Token> for Field {
-  fn from(token: Token) -> Self {
-    Field::new(token.to_string().as_str(), &RygType::from(token))
-  }
-}
-
-impl From<(String, RygType)> for Field {
-  fn from((name, kind): (String, RygType)) -> Self {
-    Field::new(&name, &kind)
-  }
-}
-
-impl From<(&str, &RygVal)> for Field {
-  fn from((name, value): (&str, &RygVal)) -> Self {
-    Field::new(name, &RygType::from(value.clone()))
-  }
-}
-
-impl Field {
-  pub fn new(name: impl std::fmt::Display, kind: &RygType) -> Field {
-    Field {
-      name: name.to_string(),
-      kind: kind.to_owned(),
-    }
-  }
-  pub fn from_val(name: &str, value: &RygVal) -> Field {
-    Field::from((name, value))
-  }
-  pub fn get_name(&self) -> String {
-    self.name.clone()
-  }
-  pub fn get_type(&self) -> RygType {
-    self.kind.clone()
-  }
-}
-
 impl Eq for RygVal {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Envr {
-  store: HashMap<String, Element>,
+  store: HashMap<String, Variable>,
   parent: Option<Box<Envr>>,
 }
 
@@ -120,7 +44,7 @@ impl Envr {
     name: String,
     value: Option<&RygVal>,
   ) -> Option<RygVal> {
-    self.store.insert(name, Element::new(value));
+    self.store.insert(name, Variable::new(value));
     if let Some(va) = value {
       Some(va.clone())
     } else {
@@ -154,12 +78,23 @@ impl Envr {
       }
     }
   }
+  pub fn get_mut(&mut self, name: &String) -> Option<RygVal> {
+    if self.store.contains_key(name) {
+      self.store.get_mut(name).and_then(|pr| Some(pr.get_value()))
+    } else {
+      if let Some(scope) = self.lookup(name) {
+        scope.get_mut(name)
+      } else {
+        None
+      }
+    }
+  }
   pub fn set(&mut self, name: &String, value: RygVal) -> Option<RygVal> {
     if let Some(scope) = self.lookup(name) {
       if scope.has(name) {
         scope
           .store
-          .insert(name.to_owned(), Element::new(Some(&value)))
+          .insert(name.to_owned(), Variable::new(Some(&value)))
           .and_then(|p| Some(p.get_value()))
       } else {
         scope.set(name, value)
@@ -174,26 +109,44 @@ impl fmt::Display for Envr {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if let Some(env) = &self.parent {
       f.debug_struct("Envr")
-        .field("in scope", &self.store)
+        .field("scope", &self.store)
         .field("parent", &env)
         .finish()
     } else {
-      f.debug_struct("Envr")
-        .field("in scope", &self.store)
-        .finish()
+      f.debug_struct("Envr").field("scope", &self.store).finish()
     }
   }
 }
 
+impl fmt::Debug for Envr {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let tbl = self.store.iter().map(|(k, v)| (k, v)).collect::<Vec<_>>();
+    let val = Variable::new(None);
+    let table = Table(tbl.as_slice());
+    f.debug_struct("Envr")
+      .field("scope", &table)
+      .field(
+        "parent",
+        if let Some(w) = &self.parent {
+          w.as_ref()
+        } else {
+          &None as &Option<&Envr>
+        },
+      )
+      .finish()
+    // write!(f, "{:?}", table)
+  }
+}
+
 #[derive(Clone, PartialEq, Eq)]
-pub struct Element {
+pub struct Variable {
   pub kind: RygType,
   value: RygVal,
   is_fixed: bool,
   initialized: bool,
 }
 
-impl fmt::Debug for Element {
+impl fmt::Debug for Variable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if self.initialized {
       write!(
@@ -208,7 +161,7 @@ impl fmt::Debug for Element {
   }
 }
 
-impl fmt::Display for Element {
+impl fmt::Display for Variable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if self.initialized {
       write!(f, "{}", self.value)
@@ -218,7 +171,7 @@ impl fmt::Display for Element {
   }
 }
 
-impl Element {
+impl Variable {
   pub fn new(value: Option<&RygVal>) -> Self {
     let (value, initialized) = if let Some(value) = value {
       (value.clone(), true)
@@ -258,7 +211,7 @@ impl Element {
     &self,
     name: String,
     map: &mut HashMap<String, Self>,
-  ) -> Option<Element> {
+  ) -> Option<Variable> {
     map.insert(name, self.clone())
   }
   pub fn get_value_mut(&mut self) -> &mut RygVal {
@@ -292,9 +245,9 @@ impl Element {
   }
 }
 
-impl From<RygVal> for Element {
+impl From<RygVal> for Variable {
   fn from(value: RygVal) -> Self {
-    Element::new(Some(&value))
+    Variable::new(Some(&value))
   }
 }
 
@@ -340,13 +293,13 @@ mod test {
     };
     let expected = Envr {
       store: HashMap::from([
-        (String::from("bar"), Element::new(Some(&bar))),
-        (String::from("baz"), Element::new(Some(&baz))),
+        (String::from("bar"), Variable::new(Some(&bar))),
+        (String::from("baz"), Variable::new(Some(&baz))),
       ]),
       parent: Some(Box::new(Envr {
         store: HashMap::from([(
           String::from("foo"),
-          Element::new(Some(&foo)),
+          Variable::new(Some(&foo)),
         )]),
         parent: None,
       })),
