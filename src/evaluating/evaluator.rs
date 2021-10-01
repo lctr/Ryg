@@ -1,6 +1,7 @@
 use std::{
   cell::{Cell, RefCell},
   collections::HashMap,
+  fmt::Display,
   ops::BitOr,
   rc::Rc,
 };
@@ -10,8 +11,8 @@ use crate::{
     function::Lambda,
     list::RygList,
     record::{Record, RecordKey},
-    rygtype::RygType,
-    rygval::{RygVal, FALSE, NIL},
+    rygtype::{Field, RygType},
+    rygval::{RygVal, FALSE, NIL, UNIT},
   },
   lexing::token::Token,
   list_compr,
@@ -24,7 +25,7 @@ use crate::{
 
 use super::{
   builtin::{load_core, load_math},
-  environment::{self, Envr, Field},
+  environment::{self, Envr},
 };
 
 #[derive(Debug)]
@@ -114,56 +115,162 @@ pub fn walk(expr: Expr, mut env: &mut Envr) -> Maybe<RygVal> {
   }
 }
 
+fn walk_index_assign(
+  body: Box<Expr>,
+  index: Box<Expr>,
+  right: Box<Expr>,
+  mut env: &mut Envr,
+) {
+}
+
+fn get_literal(expr: Expr) -> Option<Token> {
+  if let Expr::Literal(tok) = expr {
+    Some(tok)
+  } else {
+    None
+  }
+}
+
 fn walk_assign(
   op: Token,
   l: Box<Expr>,
   r: Box<Expr>,
-  env: &mut Envr,
+  mut env: &mut Envr,
 ) -> Maybe<RygVal> {
   let err = || -> Maybe<RygVal> {
     Err(Halt::RefSetError(format!(
-      ",
-    operator: {},
+      "Unable to evaluate (assignment) operator {} on:
     left: {},
     right: {}",
       &op, &l, &r
     )))
   };
 
-  if let Expr::Literal(Token::Identifier(x, _)) = *l.clone() {
-    let val = walk(*(r.clone()), env)?;
-    if op.match_literal("<-") {
-      if let Some(scope) = env.lookup(&x) {
-        match scope.set(&x, val) {
-          Some(v) => Ok(v),
-          None => err(),
+  let rhs = walk(*r.clone(), env)?;
+  match *l.clone() {
+    Expr::Index(body, index) => {
+      let mut obj = &mut walk(*body, env)?;
+      if let RygVal::Dict(mut rec) = obj.clone() {
+        if let Expr::Literal(tok) = *index.clone() {
+          let key = RecordKey::from(&tok);
+          match op.literal().as_str() {
+            "<-" => {
+              rec.set(&key, rhs.clone());
+              return Ok(rhs);
+            }
+            "=" => {
+              if rec.contains_key(&key) {
+                rec.set(&key, rhs.clone());
+                return Ok(rhs);
+              } else {
+                err()
+              }
+            }
+            x if x == "+=" || x == "-=" => {
+              if rec.contains_key(&key) {
+                if let Some(val) = rec.get(&key) {
+                  let res = if x == "+=" {
+                    val.clone() + rhs.clone()
+                  } else {
+                    val.clone() - rhs.clone()
+                  };
+                  rec.set(&key, res.clone()?);
+                  res
+                } else {
+                  err()
+                }
+              } else {
+                err()
+              }
+            }
+            _ => panic!(),
+          }
+        } else {
+          err()
         }
       } else {
-        env.def(x, Some(&val));
-        Ok(val)
-      }
-    } else {
-      match env.set(&x, val) {
-        Some(v) => Ok(v),
-        None => err(),
+        let idx = walk(*index.clone(), &mut env)?;
+        match obj.clone() {
+          RygVal::String(s) => err(),
+          RygVal::Vector(mut vs) => {
+            if obj.accepts_index(&idx) {
+              if let Some(w) = idx.as_usize() {
+                vs.iter_mut().enumerate().for_each(|(i, mut rv)| {
+                  rv = &mut if i == w {
+                    rhs.clone()
+                  } else {
+                    rv.to_owned()
+                  };
+                });
+                Ok(rhs.clone())
+              } else {
+                Err(Halt::InvalidInput(format!("Index {} is out of bounds for {}", idx, &obj)))
+              }
+            } else { err() }
+          }
+          RygVal::Tuple(_, vs) => {
+            Err(Halt::Evaluating(format!("Tuples are immutable and cannot have their components assigned to! Unable to change index {} of tuple {}", idx, &obj)))
+          }
+          _ => err(),
+        }
       }
     }
-  } else {
-    err()
+    Expr::Literal(Token::Identifier(x, _)) => {
+      let val = walk(*(r.clone()), env)?;
+
+      match op.literal().as_str() {
+        "<-" => {
+          match env.lookup(&x) {
+            Some(v) => v.set(&x, val.clone()),
+            None => env.def(x, Some(&val)),
+          };
+          return Ok(val);
+        }
+        "=" => {
+          let res = match env.set(&x, val.clone()) {
+            Some(v) => Ok(v),
+            None => err(),
+          };
+          return res;
+        }
+
+        "+=" | "-=" => {
+          let before = env.get(&x);
+          if let Some(bv) = before {
+            let after = apply_op(
+              Token::Operator(
+                op.literal().chars().nth(0).unwrap().to_string(),
+                op.get_pos().unwrap().to_owned(),
+              ),
+              bv,
+              val,
+            );
+            if let Ok(aft1) = after {
+              env.set(&x, aft1.to_owned());
+              Ok(aft1)
+            } else {
+              err()
+            }
+          } else {
+            err()
+          }
+        }
+        "<|" => err(),
+        _ => err(),
+      }
+    }
+    _ => err(),
   }
 }
 
 fn walk_record(
   kind: Kind<Token>,
   bindings: Vec<Binding>,
-  env: &mut Envr,
+  mut env: &mut Envr,
 ) -> Maybe<RygVal> {
-  let map = &mut HashMap::new();
-  // for bnd in bindings.iter() {
-  //   let key_name = bnd.pram.name.to_string();
-  //   let value = &RygVal::String(key_name);
-  // }
-  let mut pairs = vec![];
+  let map = HashMap::new();
+  let mut record = Record::new(map);
+  let mut pairs: Vec<(RecordKey, RygVal)> = vec![];
   let body = bindings.iter().for_each(|bnd| {
     let key = RecordKey::new(&RygVal::String(bnd.pram.name.to_string()))
       .unwrap()
@@ -176,18 +283,16 @@ fn walk_record(
         bnd.expr
       ))))
     };
-    map.insert(key.to_owned(), val.to_owned());
-    pairs.push((key, val));
+    record.set(&key, val);
   });
-  // println!("{:?}", map.clone());
-  let record = RygVal::Object(Record { map: map.clone() });
+  let record = RygVal::Dict(record);
   match kind.0 {
     Token::Identifier(n, ..) | Token::Meta(n, ..) => {
       env.def(n, Some(&record));
+      Ok(record)
     }
-    _ => {}
-  };
-  Ok(record)
+    _ => Ok(record),
+  }
 }
 
 fn walk_loop(
@@ -243,7 +348,13 @@ fn walk_iter(
   t: Option<Box<Expr>>,
   mut env: &mut Envr,
 ) -> Maybe<RygVal> {
-  let lower_val = walk(*x, &mut env);
+  fn err<K: Display>(point: K, label: &str) -> Maybe<K> {
+    Err(Halt::InvalidType(format!(
+      "{} is not a valid range {} position!",
+      point, label
+    )))
+  }
+  let lower_val = walk(*x.clone(), &mut env);
   match (lower_val.clone(), t.clone()) {
     (Ok(low_val), Some(hi_val)) => {
       let rval = walk(*hi_val, &mut env);
@@ -261,12 +372,7 @@ fn walk_iter(
       let start: Maybe<i32> = match low_val {
         RygVal::Int(n) => Ok(n),
         RygVal::Float(n) => Ok(n.floor() as i32),
-        _ => {
-          return Err(Halt::InvalidType(format!(
-            "{} is not a valid range start point!",
-            low_val
-          )))
-        }
+        _ => return err(low_val, "start"),
       };
       if let Ok(idx) = start {
         let rng = (idx..)
@@ -275,10 +381,7 @@ fn walk_iter(
           .collect::<Vec<_>>();
         return Ok(RygVal::Vector(rng));
       } else {
-        return Err(Halt::InvalidType(format!(
-          "{:?} is not a valid range start point!",
-          start
-        )));
+        return err(low_val, "start");
       }
     }
     (_, Some(hi_val)) => {
@@ -287,12 +390,7 @@ fn walk_iter(
         Ok(RygVal::Int(i)) => Ok(i),
         Ok(RygVal::Float(j)) => Ok(j.floor() as i32),
         Err(h) => return Err(h),
-        _ => {
-          return Err(Halt::InvalidType(format!(
-            "{} is not a valid range end point!",
-            hi_val
-          )))
-        }
+        _ => return err(rval.unwrap(), "end"),
       };
       if let Ok(fin) = end {
         let rng = (0..)
@@ -302,49 +400,11 @@ fn walk_iter(
           .collect::<Vec<_>>();
         return Ok(RygVal::Vector(rng));
       } else {
-        return Err(Halt::InvalidType(format!(
-          "{} is not a valid range end point!",
-          hi_val
-        )));
+        return err(rval.unwrap(), "end");
       }
     }
-    (_, None) => {
-      todo!()
-    }
+    (_, None) => err(walk(*x, &mut env).unwrap(), "end"),
   }
-  // let upper_val = if let Some(lst) = t {
-  //   let upper_bound = walk(*lst, &mut env);
-
-  //   match (lower_val, upper_bound) {
-  //     (Ok(low), Ok(high)) => {}
-  //     (Ok(low), Err(h)) => return Err(h),
-  //     (Err(_), Ok(high)) => {}
-  //     (Err(_), Err(_)) => {}
-  //   };
-
-  //   if let (Ok(low), Ok(high)) = (lower_val, upper_bound) {
-  //     if let Ok(pair) = RygVal::coerce_nums(low, high) {
-  //       match pair {
-  //         Either::Left((i, j)) => {
-  //           let mut base = vec![];
-  //           return Ok(RygVal::from(
-  //             (i..j).map(RygVal::from).collect::<Vec<_>>(),
-  //           ));
-  //         }
-  //         Either::Right((i, j)) => {
-  //           let mut base = vec![];
-  //           let (i1, j1) = (i.floor() as i32, j.floor() as i32);
-  //           return Ok(RygVal::from(
-  //             (i1..j1).map(RygVal::from).collect::<Vec<_>>(),
-  //           ));
-  //         }
-  //       };
-  //     } else {
-  //     }
-  //   };
-  // } else {
-  //   Ok(RygVal::Unit())
-  // };
 }
 
 fn walk_index(
@@ -354,68 +414,118 @@ fn walk_index(
 ) -> Maybe<RygVal> {
   let err = |index: RygVal, whole: RygVal| {
     Err(Halt::Evaluating(format!(
-      "Invalid range error! {:?} is not a valid range for {:?}",
+      "Invalid lookup error! {:?} is not a valid index/field for {:?}",
       &index, &whole
     )))
   };
   let body = walk(*body.clone(), env)?;
-  if body.is_vector() || body.is_string() {
-    let v = body.get_vector()?;
-    let idx = walk(*index.clone(), env)?;
-    let len = v.len();
-    let m = match idx {
-      RygVal::Float(q) if idx.is_float() => q.floor(),
-      RygVal::Int(m) if idx.is_int() => m as f64,
-      _ => return err(idx, body),
-    };
-    if m >= 0.0 && m < len as f64 {
-      Ok(v.get(m as usize).unwrap().clone())
-    } else {
-      err(RygVal::Float(m), body)
+  // if let Expr::Iter(ia, ib) = *index {
+  //   let rng = walk_iter(ia, ib, env)?;
+  // } else {
+  // }
+  match body.clone() {
+    RygVal::String(v) => {
+      if let Expr::Iter(ia, ib) = *index {
+        let rng = walk_iter(ia, ib, env)?;
+        let slice = rng
+          .to_vec()
+          .into_iter()
+          .zip(v.chars())
+          .map(|(rv, c)| RygVal::Char(c, None))
+          .collect::<Vec<RygVal>>();
+        Ok(RygVal::Vector(slice))
+      } else {
+        let len = v.len();
+        let idx = walk(*index, env)?;
+        match idx.as_usize() {
+          Some(i) => {
+            if i < len {
+              Ok(match v.chars().nth(i) {
+                Some(c) => RygVal::Char(c, None),
+                None => RygVal::Char('·', Some('\\')),
+              })
+            } else {
+              Err(Halt::Evaluating(format!(
+                "Index {} is out of bounds for {}",
+                idx, body,
+              )))
+            }
+          }
+          None => err(idx, body),
+        }
+      }
     }
-  } else {
-    Err(Halt::Evaluating(format!(
-      "Invalid range error! The object {:?} is not a vector!",
-      body
-    )))
+    RygVal::Vector(v) | RygVal::Tuple(_, v) => {
+      if let Expr::Iter(ia, ib) = *index {
+        let rng = walk_iter(ia, ib, env)?;
+        let slice = rng
+          .to_vec()
+          .into_iter()
+          .zip(v.into_iter())
+          .map(|(l, r)| r)
+          .collect::<Vec<RygVal>>();
+        Ok(RygVal::Vector(slice))
+      } else {
+        let len = v.len();
+        let idx = walk(*index.clone(), env)?;
+        let m = match idx.clone() {
+          RygVal::Float(q) => q.floor() as usize,
+          RygVal::Int(m) => m as usize,
+          _ => return err(idx, body),
+        };
+        if m >= 0 && m < len {
+          if let Some(res) = v.get(m as usize) {
+            Ok(res.clone())
+          } else {
+            err(idx, body)
+          }
+        } else if m < 0 && m - len > 0 {
+          if let Some(res) = v.get((len - m) as usize) {
+            Ok(res.clone())
+          } else {
+            err(idx, body)
+          }
+        } else {
+          err(idx, body)
+        }
+      }
+    }
+    RygVal::Dict(rec) => {
+      if let Expr::Literal(tok) = *index {
+        let key = RecordKey::new(&RygVal::String(tok.literal()));
+        if let Some(rk) = key {
+          if let Some(res) = rec.get(&rk) {
+            return Ok(res.to_owned());
+          } else {
+            Err(Halt::UnknownError(format!(
+              "The unable to find recordkey {} in record {:#?}",
+              rk, rec
+            )))
+          }
+        } else {
+          err(RygVal::Nil(), RygVal::Dict(rec))
+        }
+      } else {
+        err(RygVal::Nil(), RygVal::Dict(rec))
+      }
+    }
+    _ => err(walk(*index.clone(), env)?, body),
   }
 }
 
 fn walk_literal(t: Token, env: &mut Envr) -> Maybe<RygVal> {
-  if !t.is_identifier() {
-    Ok(RygVal::from_token(t))
-  } else {
+  if t.is_identifier() || t.is_meta() {
     let scope = env.lookup(&t.clone().literal());
     match scope {
       Some(ctx) => ctx
         .to_owned()
-        .get(&t.to_string())
+        .get_mut(&t.to_string())
         .ok_or(Halt::RefGetError(t.to_string())),
       None => Err(Halt::RefGetError(t.to_string())),
     }
+  } else {
+    Ok(RygVal::from_token(t))
   }
-  // if let Token::Identifier(v, _) = t.clone() {
-  //   let scope = env.lookup(v.clone());
-  //   if let Some(Envr { ancestor, bindings }) = scope {
-  //     if let Some(res) = bindings.get(&Field::from(t.to_owned())) {
-  //       return Ok(res.clone());
-  //     } else {
-  //       if let Some(outer) = ancestor {
-  //         if let Some(res) = outer.bindings.get(&Field::from(t.to_owned()))
-  // {           return Ok(res.clone());
-  //         } else {
-  //           return Err(Halt::RefGetError(v));
-  //         }
-  //       } else {
-  //         return Err(Halt::RefGetError(v));
-  //       }
-  //     }
-  //   } else {
-  //     return Err(Halt::RefGetError(v));
-  //   }
-  // } else {
-  //   Ok(RygVal::from_token(t))
-  // }
 }
 
 fn walk_case(
@@ -488,8 +598,7 @@ fn walk_list(defn: Definition, env: &mut Envr) -> Maybe<RygVal> {
             (_, Err(e)) => (a.clone().0, Err(e)),
           }
         })
-      } else  // if let Expr::Literal(Token::Number(n, b, _)) = var
-       {
+      } else {
         (RygType::Halt, Err(Halt::InvalidInput(format!("The provided token {} is not a valid generator identifier!", var))))
       }
     } else {
@@ -526,8 +635,12 @@ fn walk_list(defn: Definition, env: &mut Envr) -> Maybe<RygVal> {
   )))
 }
 
-fn pattern_match(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
-  match (pattern, rygval.clone()) {
+pub fn pattern_match(
+  pattern: TokPattern,
+  rygval: RygVal,
+  mut scope: &mut Envr,
+) {
+  match (pattern.clone(), rygval.clone()) {
     (TokPattern::Empty, _) => {
       RygVal::Nil(); // throw error?
     }
@@ -553,18 +666,26 @@ fn pattern_match(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
             };
           });
         }
-        (TokPattern::Record(obj), RygVal::Object(record)) => {
+        (TokPattern::Record(obj), RygVal::Dict(record)) => {
           obj.iter().for_each(|tp| {
             pattern_match(
               tp.to_owned(),
-              RygVal::Object(record.to_owned()),
+              RygVal::Dict(record.to_owned()),
               &mut scope,
             )
           });
         }
-        _ => todo!(),
+        (
+          TokPattern::Vector(ts) | TokPattern::Tuple(ts),
+          rv @ (RygVal::Nil() | RygVal::Unit()),
+        ) => {
+          ts.iter().for_each(|tp| {
+            pattern_match(tp.to_owned(), RygVal::Nil(), &mut scope)
+          });
+        }
+        _ => println!("pat: {:?}, val: {}", pat, rygval),
       }),
-    (TokPattern::Record(vt), RygVal::Object(rhs)) => {
+    (TokPattern::Record(vt), RygVal::Dict(rhs)) => {
       for pat in vt {
         if let TokPattern::Atom(tk) = pat {
           [RygVal::String, RygVal::Symbol].iter().for_each(|tok| {
@@ -577,7 +698,15 @@ fn pattern_match(pattern: TokPattern, rygval: RygVal, mut scope: &mut Envr) {
         }
       }
     }
-    _ => todo!(),
+    (
+      TokPattern::Vector(ts) | TokPattern::Tuple(ts),
+      rv @ (RygVal::Nil() | RygVal::Unit()),
+    ) => {
+      ts.iter().for_each(|tp| {
+        pattern_match(tp.to_owned(), RygVal::Nil(), &mut scope)
+      });
+    }
+    _ => println!("pat: {:?}, val: {}", pattern, rygval),
   };
 }
 
@@ -603,7 +732,7 @@ fn walk_let<'a, 'b: 'a>(
         }
         (Shape::Vector, RygVal::Vector(v))
         | (Shape::Tuple, RygVal::Tuple(_, v)) => {
-          pattern_match(pattern, rval, scope)
+          pattern_match(pattern, rval, &mut scope)
         }
         (..) => {
           scope.def(name.literal(), Some(&rval));
@@ -635,16 +764,14 @@ fn walk_call(
 }
 
 fn walk_block(body: Vec<Expr>, mut env: &mut Envr) -> Maybe<RygVal> {
+  let scope = &mut env.extend();
   if body.len() == 1 {
     return walk(body.clone().get(0).unwrap().to_owned(), &mut env);
   };
-  let mut result = NIL;
-  let scope = env;
-
+  let mut result = UNIT;
   for expr in body {
     result = walk(expr, scope)?;
   }
-  // body.iter().fold(init, f)
   Ok(result)
 }
 
@@ -686,21 +813,19 @@ fn walk_lambda(
   body: Box<Expr>,
   mut env: &mut Envr,
 ) -> Maybe<RygVal> {
-  let mut lam_scope = env.extend();
+  let mut lam_scope = &mut env.extend();
   let mut types: Vec<Field> = vec![];
-  let _types = prams
-    .iter()
-    .map(|p| {
-      if matches!(p.name, Token::Empty()) {
-        Field::new("", &RygType::Unit)
-      } else {
-        let rygtype = RygType::from(p.to_owned());
-        let field = Field::new(p.name.literal().as_str(), &rygtype);
-        lam_scope.def(field.clone().name, None);
-        field
-      }
-    })
-    .collect::<Vec<_>>();
+  prams.iter().for_each(|p| {
+    pattern_match(p.clone().pattern, RygVal::Unit(), lam_scope);
+    // if matches!(p.name, Token::Empty()) {
+    //   Field::new("", &RygType::Unit)
+    // } else {
+    //   let rygtype = RygType::from(p.to_owned());
+    //   let field = Field::new(p.name.literal().as_str(), &rygtype);
+    //   lam_scope.def(field.clone().name, None);
+    //   field
+    // }
+  });
 
   let mut lam = Lambda {
     name: name.clone(),
@@ -726,7 +851,23 @@ fn walk_binary(
   right: Box<Expr>,
   env: &mut Envr,
 ) -> Maybe<RygVal> {
-  apply_op(op, walk(*left, env)?, walk(*right, env)?)
+  match op.literal().as_str() {
+    "=>" => {
+      if let Ok(RygVal::Bool(true)) = walk(*left, env) {
+        walk(*right, env)
+      } else {
+        Ok(RygVal::Unit())
+      }
+    }
+    "<>" | "++" => {
+      let rhs = walk(*right, env)?;
+      match apply_op(op, walk(*left, env)?, rhs) {
+        Ok(v) => Ok(v),
+        Err(h) => Err(h),
+      }
+    }
+    _ => apply_op(op, walk(*left, env)?, walk(*right, env)?),
+  }
 }
 
 fn apply_conc(left: RygVal, right: RygVal) -> Maybe<RygVal> {
@@ -737,9 +878,9 @@ fn apply_conc(left: RygVal, right: RygVal) -> Maybe<RygVal> {
   if [left.clone()].iter().all(|r| r.is_vector()) {
     Ok(RygVal::Vector(
       left
-        .get_vector()?
+        .to_vec()
         .iter()
-        .chain(right.get_vector()?.iter())
+        .chain(right.to_vec().iter())
         .map(|x| x.clone())
         .collect::<Vec<_>>(),
     ))
@@ -784,24 +925,7 @@ fn apply_op(operator: Token, left: RygVal, right: RygVal) -> Maybe<RygVal> {
       "|" => Ok(RygVal::Byte(left.get_byte()? | right.get_byte()?)),
       "^" => Ok(RygVal::Byte(left.get_byte()? ^ right.get_byte()?)),
       "<>" => apply_conc(left, right),
-      "++" => (|l: RygVal, r: RygVal| {
-        return Ok((|arr: Vec<RygVal>| {
-          if matches!(
-            (l.clone(), r.clone()),
-            (RygVal::Tuple(..), RygVal::Tuple(..))
-          ) {
-            return RygVal::Tuple(arr.len(), arr);
-          } else {
-            return RygVal::Vector(arr);
-          }
-        })(
-          l.to_vec()
-            .iter()
-            .chain(r.to_vec().iter())
-            .map(|v| v.clone())
-            .collect::<Vec<_>>(),
-        ));
-      })(left.clone(), right.clone()),
+      "++" => apply_append(left, right),
       _ => invalid(),
     }
   } else {
@@ -809,8 +933,38 @@ fn apply_op(operator: Token, left: RygVal, right: RygVal) -> Maybe<RygVal> {
   }
 }
 
-fn apply_append(left: RygVal, right: RygVal) {
-  // if left.is
+fn apply_append(left: RygVal, right: RygVal) -> Maybe<RygVal> {
+  let get_len = |rv: &RygVal| -> Maybe<usize> {
+    match rv {
+      RygVal::Nil() | RygVal::Unit() => Ok(0),
+      RygVal::Bool(_)
+      | RygVal::Byte(_)
+      | RygVal::Int(_)
+      | RygVal::Float(_)
+      | RygVal::Char(_, _) => Ok(1),
+      RygVal::String(s) | RygVal::Symbol(s) => Ok(s.len()),
+      RygVal::Vector(v) => Ok(v.len()),
+      RygVal::Tuple(n, v) => {
+        if n == &v.len() {
+          Ok(*n)
+        } else {
+          Err(Halt::Unexpected(format!(
+            "Tuple issue! Len {} doesn't match body {:?}",
+            n, v
+          )))
+        }
+      }
+      RygVal::List(l) => Ok(1),
+      RygVal::Lambda(_) => Ok(1),
+      RygVal::Error(v) => Err(*v.to_owned()),
+      RygVal::Function(f) => Ok(1),
+      RygVal::Dict(r) => Ok(r.get_keys().len()),
+    }
+  };
+  Ok(RygVal::Tuple(
+    get_len(&left)? + get_len(&right)?,
+    vec![left, right],
+  ))
 }
 
 fn walk_unary(o: Token, r: Box<Expr>, env: &mut Envr) -> Maybe<RygVal> {
@@ -844,11 +998,12 @@ mod test {
   use std::rc::Rc;
 
   use crate::{
-    core::{rygtype::RygType, rygval::RygVal},
-    evaluating::{
-      environment::{Envr, Field},
-      evaluator::walk,
+    core::{
+      rygtype::{Field, RygType},
+      rygval::RygVal,
     },
+    evaluating::{environment::Envr, evaluator::walk},
+    log_do,
     parsing::parser::parse_input,
     util::types::{Either, Maybe},
   };
@@ -966,8 +1121,18 @@ mod test {
 
   #[test]
   fn test_record() {
-    let src = "#{a -> \"cat\", is -> \"cute\"};";
+    let src = "#{a = \"cat\", is = \"cute\"};";
     println!("{:?}", run(src));
+  }
+
+  #[test]
+  fn inspect_pattern_lambda() {
+    let src = "let sum = |[a, b]| a + b in (sum, sum([1, 2]))";
+    let mut env = Envr::new();
+    log_do!(
+      "result" => run(src),
+      "env" => &env
+    );
   }
 
   #[test]
