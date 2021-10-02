@@ -304,28 +304,6 @@ impl<'a> Parser<'a> {
     expr
   }
 
-  pub fn bin_right<F: FnMut(&mut Self) -> Expr>(
-    &mut self,
-    this_prec: usize,
-    mut parse: &mut F,
-  ) -> Expr {
-    let mut token = self.peek();
-    let mut expr = parse(self);
-    while let Token::Operator(op, _) = token.clone() {
-      // if let Some((pr, dir)) = token.operator_info() {}
-      let that_prec =
-        if token.match_any_of(&["->", "=", "<-", "<>", "++", "**"]) {
-          token.precedence().unwrap()
-        } else {
-          this_prec + 1
-        };
-      let rhs = self.bin_right(that_prec, parse);
-      expr = Expr::Assign(token.clone(), Box::new(expr), Box::new(rhs));
-      token = self.peek();
-    }
-    expr
-  }
-
   pub fn unary(&mut self) -> Expr {
     if self.match_any_of(&["!", "-"]) {
       let mut op = self.next();
