@@ -5,6 +5,7 @@ use crate::{
     lexer::Lexer,
     token::{Assoc, Token},
   },
+  log_do,
   parsing::expression::{Binding, Definition},
   util::{
     state::{Halt, Pos, StreamState, Streaming},
@@ -242,8 +243,10 @@ impl<'a> Parser<'a> {
     match token.clone() {
       x if x.as_operator().is_none() => left,
       Token::Operator(..) => {
-        if let Some((that_prec)) = token.clone().precedence() {
-          if (this_prec < that_prec) {
+        if let Some((that_prec, assoc)) = token.clone().operator_info() {
+          if (this_prec < that_prec
+            || (this_prec == that_prec && matches!(assoc, Assoc::Right)))
+          {
             self.next();
             left = self.maybe_unary(
               token.clone(),
@@ -284,7 +287,7 @@ impl<'a> Parser<'a> {
     this_prec: usize,
     mut parse: &mut F,
   ) -> Expr {
-    let mut expr = self.atom(); //parse(self);
+    let mut expr = self.atom();
     let mut token = self.peek();
     while let Some((that_prec, assoc2)) = token.operator_info() {
       let other = match assoc2 {
@@ -543,14 +546,21 @@ impl<'a> Parser<'a> {
     let mut conds = vec![];
     let rhs = self.delimited(("|", ",", "]"), &mut |p| {
       let expr = p.expression();
-      if let Expr::Assign(op, b, c) = expr {
+      if let Expr::Assign(op, b, c) = expr.to_owned() {
         match op.literal().as_str() {
           "<-" => ranges.push((*b, *c)),
           "=" => fixed.push((*b, *c)),
           _ =>
           /* TODO */
           {
-            panic!("{:?}", p.peek())
+            log_do!(
+                "Invalid expression in list comprehension!" => &expr,
+                "Op" => &op,
+                "Token" => p.peek(),
+                "fixed" => &fixed,
+                "ranges" => &ranges,
+                "conds" => &conds
+            )
           }
         };
       } else {
@@ -750,6 +760,15 @@ impl<'a> Parser<'a> {
 
   fn pattern(&mut self) -> TokPattern {
     let token = self.peek();
+    // match token.to_owned() {
+    //   Token::Identifier(_, _) => todo!(),
+    //   Token::Symbol(_, _) => todo!(),
+    //   Token::Operator(_, _) => todo!(),
+    //   Token::Punct(c, _) => ,
+    //   Token::Meta(_, _) => todo!(),
+    //   Token::Eof(_) => todo!(),
+
+    // };
     if !token.is_left_punct() {
       TokPattern::Atom(self.next())
     } else {
@@ -796,6 +815,10 @@ impl<'a> Parser<'a> {
     ));
     let _ = flag.and_then(|word| {
       while !self.match_literal(word) && !self.lexer.done() {
+        if self.get_pos().new_line {
+          self.state = StreamState::Pending(self.next());
+          break;
+        }
         Some(self.next());
         if self.match_literal(word) {
           self.state = StreamState::Halted(Token::Invalid(
