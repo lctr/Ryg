@@ -218,7 +218,14 @@ impl<'a> Lexer<'a> {
     word.push_str(&self.eat_while(|c| is_name(&c.to_string())));
     match word.as_str() {
       "true" | "false" => Token::Boolean(word, pos),
-      w if is_kw(w) => Token::Keyword(w.to_string(), pos),
+      w if is_kw(w) => {
+        let tok = Token::Keyword(w.to_string(), pos.clone());
+        if tok.as_operator().is_some() {
+          Token::Operator(w.to_string(), pos)
+        } else {
+          tok
+        }
+      }
       w if is_built_in(w) => Token::Meta(w.to_string(), pos),
       w if is_name(&word)
         && Token::Keyword(word.clone(), pos.clone())
@@ -307,14 +314,9 @@ impl<'a> Lexer<'a> {
           escaped = false;
           // word.push(c);
           match c {
-            't' | 'n' | 'r' | '"' | '\'' => {
-              word.push_str(format!("\\\\{}", c).as_str());
-            }
+            esc if is_escapable(esc) => word.push(get_escaped(esc)),
             // TODO: parsing unicode escapes
             // 'u' => unicode(self).1 as ,
-            '\\' => {
-              word.push('\\');
-            }
             '\0' => { /* null grapheme */ }
             _ => {
               word.push(c);
@@ -450,7 +452,7 @@ pub fn is_name(word: &String) -> bool {
 }
 
 pub fn is_escapable(c: char) -> bool {
-  matches!(c, 't' | 'n' | 'r' | '"' | '\'' | '\\')
+  matches!(c, 't' | 'n' | 'r' | '"' | '\'' | '\\' | '\"')
 }
 
 pub fn get_escaped(c: char) -> char {
@@ -459,6 +461,7 @@ pub fn get_escaped(c: char) -> char {
     'n' => '\n',
     'r' => '\r',
     '"' => '\"',
+    '\"' => '\"',
     '\'' => '\'',
     '\\' => '\\',
     _ => c,
@@ -647,14 +650,13 @@ pub fn is_kw(s: &str) -> bool {
       | "true"
       | "false"
       | "at"
-      | "with"
       | "in"
       | "case"
       | "of"
       | "fn"
+      | "where"
+      | "with"
       | "is"
-      | "isn't"
-      | "aren't"
       | "and"
       | "or"
       | "xor"
@@ -807,7 +809,13 @@ mod tests {
 
   #[test]
   fn lambda_call() {
-    let src = "it's (2) _ ";
+    let src = "it's (2) _ mod 12";
+    inspect_tokens(src);
+  }
+
+  #[test]
+  fn escaped_str() {
+    let src = "a\nb";
     inspect_tokens(src);
   }
 
