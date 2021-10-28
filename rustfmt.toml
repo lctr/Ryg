@@ -1,7 +1,7 @@
 blank_lines_upper_bound = 1
 wrap_comments = true
 # fn_single_line = true
-tab_spaces = 2
+# tab_spaces = 2
 max_width = 79
 brace_style = "PreferSameLine"
 color = "Always"
