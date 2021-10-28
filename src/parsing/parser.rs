@@ -1,23 +1,24 @@
-use std::{
-    fmt::{Debug, Display},
-    rc::Rc,
-};
+use std::fmt::Debug;
 
 use crate::{
-    lexing::{
-        lexer::{twin_of, Lexer},
+    log_do,
+    parsing::expression::{
+        Binding, DataVariant, Definition, Program, VariantArg,
+    },
+    tok::{
+        lexer::{twin_of, Lexer, ToLiteral},
+        stream::{Pos, Streaming},
         token::{Assoc, Token},
     },
-    log_do,
-    parsing::expression::{Binding, Definition},
     util::{
-        state::{Halt, Pos, StreamState, Streaming},
-        types::{Either, Kind, Maybe},
+        state::{Halt, StreamState},
+        types::{Kind, Maybe},
     },
 };
 
-use super::expression::{Expr, Lexeme, Parameter, Shape};
+use super::expression::{Expr, Morpheme, Parameter, Shape};
 
+#[derive(Clone)]
 pub struct Parsed<'a, T>(&'a [T]);
 impl<'a, T: Debug> std::fmt::Debug for Parsed<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +28,10 @@ impl<'a, T: Debug> std::fmt::Debug for Parsed<'a, T> {
 
 impl<'a> Parsed<'a, Expr> {
     pub fn as_block(&self) -> Expr {
-        Expr::Block((&(self.0)).to_vec())
+        Expr::Block(false, (&(self.0)).to_vec())
+    }
+    pub fn as_do_block(&self) -> Expr {
+        Expr::Block(true, (&(self.0)).to_vec())
     }
     pub fn iter(&self) -> std::slice::Iter<'a, Expr> {
         self.0.iter()
@@ -43,11 +47,11 @@ impl<'a> From<Parsed<'a, Expr>> for Expr {
     }
 }
 
-pub enum ParserError {
-    Unexpected,
-    Invalid,
-    Unbalanced,
-}
+// pub enum ParserError {
+//     Unexpected,
+//     Invalid,
+//     Unbalanced,
+// }
 
 #[derive(Debug)]
 pub struct Parser<'a> {
@@ -57,8 +61,10 @@ pub struct Parser<'a> {
     has_error: bool,
 }
 
-impl<'a> Streaming<Token> for Parser<'a> {
-    fn peek(&mut self) -> Token {
+impl<'a> Streaming for Parser<'a> {
+    type T = Token;
+    fn peek(&mut self) -> Self::T {
+        // println!("{}", self.lexer.peek());
         self.lexer.peek()
     }
 
@@ -86,8 +92,8 @@ impl<'a> Streaming<Token> for Parser<'a> {
 
 #[allow(unused)]
 impl<'a> Parser<'a> {
-    pub fn new(src: &str) -> Parser {
-        Parser {
+    pub fn new(src: &'a str) -> Self {
+        Self {
             lexer: Lexer::new(src),
             state: StreamState::new(None),
             parsed: vec![],
@@ -153,29 +159,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn maybe_delimited<K, F: FnMut(&mut Self) -> K>(
-        &mut self,
-        sep: Option<&str>,
-        mut parser: F,
-    ) -> Either<K, Vec<K>> {
-        let token = self.peek();
-        let infix = sep.unwrap_or(",");
-        if let Token::Punct(c @ ('(' | '[' | '{' | '<'), _) = token {
-            let c = &c.to_string();
-            Either::Right(self.delimited((c, infix, twin_of(c)), &mut parser))
-        } else {
-            Either::Left(parser(self))
-        }
-    }
-
+    // unlike the algorithm used for where clauses, we allow for a single empty
+    // trailing infix delimiter
     pub fn delimited<K, F: FnMut(&mut Self) -> K>(
         &mut self,
-        (prefix, infix, suffix): (&str, &str, &str),
+        [prefix, infix, suffix]: [&str; 3],
         parser: &mut F,
     ) -> Vec<K> {
         let mut nodes: Vec<K> = vec![];
-        self.eat(prefix);
         let mut first = true;
+        self.eat(prefix);
         while !self.done() {
             if self.match_literal(suffix) {
                 break;
@@ -183,51 +176,20 @@ impl<'a> Parser<'a> {
             if first {
                 first = false;
             } else {
-                self.eat(infix).expect(
-                    "Unable to find separator in delimited expression!",
-                );
+                self.eat(infix);
             };
             if self.match_literal(suffix) {
                 break;
             };
-            nodes.push(parser(self));
+            nodes.push(parser(self))
         }
         self.eat(suffix);
         nodes
     }
 
-    // rewrite of above to catch unbalanced groupings
-    pub fn delimited_<K: std::fmt::Debug, F: FnMut(&mut Self) -> K>(
-        &mut self,
-        (prefix, infix, suffix): (&'a str, &'a str, &'a str),
-        parse: &'a mut F,
-    ) -> Maybe<Vec<K>> {
-        self.guard_depth(&mut move |parser: &mut Self| {
-            let mut nodes = vec![];
-            parser.eat(prefix);
-            let mut first = true;
-            while !parser.done() {
-                if parser.match_literal(suffix) {
-                    break;
-                };
-                if first {
-                    first = false
-                } else {
-                    parser.eat(infix);
-                };
-                if parser.match_literal(suffix) {
-                    break;
-                };
-                nodes.push(parse(parser));
-            }
-            parser.eat(suffix);
-            nodes
-        })
-    }
-
     pub fn parse(&mut self) -> Expr {
         let mut body: Vec<Expr> = vec![];
-        while !self.done() {
+        while !self.done() && !self.state.is_halted() {
             let expr = self.expression();
             if let Expr::Error(h, t) = expr {
                 panic!("{}; token: {}", h, t);
@@ -238,7 +200,7 @@ impl<'a> Parser<'a> {
                 }
             };
         }
-        Expr::Block(body)
+        Expr::Program(Program::new(None, body, self.lexer.take_meta()))
     }
 
     pub fn expression(&mut self) -> Expr {
@@ -247,80 +209,31 @@ impl<'a> Parser<'a> {
         expr
     }
 
-    pub fn maybe_call<F: FnMut(&mut Self) -> Expr>(
+    pub fn maybe_where<F: FnMut(&mut Self) -> Expr>(
         &mut self,
         mut parse: F,
     ) -> Expr {
         let expr = parse(self);
-        let mut token = self.peek();
-        match token.literal().as_str() {
-            "(" => self.call(expr),
-            "." => self.maybe_access(expr),
-            "[" => self.maybe_index(expr),
-            _ => expr,
+        if self.match_literal("where") {
+            self.where_binding(expr)
+        } else {
+            expr
         }
     }
 
-    pub fn maybe_index(&mut self, body: Expr) -> Expr {
-        self.eat_match("[", &mut |parser, b| {
-            if b {
-                let idx = parser.expression();
-                parser.eat("]");
-                let expr =
-                    Expr::Index(Box::new(body.to_owned()), Box::new(idx));
-                parser.maybe_call(&mut |p2: &mut Parser| expr.to_owned())
-            } else {
-                body.to_owned()
-            }
-        })
-    }
-
-    pub fn maybe_access(&mut self, expr: Expr) -> Expr {
-        self.eat_match(".", &mut |p: &mut Parser, b| {
-            if b {
-                let id = p.next();
-                if let Token::Identifier(..) | Token::Number(..) = id {
-                    let expr2 = Expr::Index(
-                        Box::new(expr.to_owned()),
-                        Box::new(Expr::Literal(id)),
-                    );
-                    p.maybe_call(&mut |p: &mut Parser| expr2.to_owned())
-                } else {
-                    Expr::Error(
-                        Halt::InvalidInput(format!(
-              "Invalid access token {} may not be used in lookups for {}",
-              id, expr
-            )),
-                        p.peek(),
-                    )
-                }
-            } else {
-                expr.to_owned()
-            }
-        })
-    }
-
-    pub fn call(&mut self, expr: Expr) -> Expr {
-        Expr::Call(
-            Box::new(expr.clone()),
-            self.delimited(("(", ",", ")"), &mut Self::expression),
-            match expr {
-                Expr::Literal(id) => Some(id.literal()),
-                Expr::Lambda(n, ..) => n,
-                Expr::Call(.., n) => n,
-                _ => None,
-            },
-        )
+    pub fn top_level(&mut self) -> Expr {
+        self.maybe_call(Self::maybe_binary)
     }
 
     pub fn atom(&mut self) -> Expr {
-        self.maybe_call(Self::terminal)
+        self.maybe_call(Self::nonterminal)
     }
 
     pub fn maybe_binary(&mut self) -> Expr {
         self.binary(0, &mut Self::atom)
     }
 
+    #[inline]
     fn cobinary(
         &mut self,
         token: Token,
@@ -356,7 +269,7 @@ impl<'a> Parser<'a> {
                     token,
                     Some(left.clone()),
                     (this_prec, that_prec),
-                )
+                );
             };
         };
         left
@@ -371,7 +284,7 @@ impl<'a> Parser<'a> {
     ) -> Expr {
         let mut left = parse(self);
         let mut token = self.peek();
-        while token.match_any_of(ops) {
+        while token.match_any_of(ops) && !self.done() {
             self.next();
             left = Expr::from_operator(&token)(
                 token,
@@ -383,8 +296,223 @@ impl<'a> Parser<'a> {
         left
     }
 
+    pub fn maybe_call<F: FnMut(&mut Self) -> Expr>(
+        &mut self,
+        mut parse: F,
+    ) -> Expr {
+        let expr = parse(self);
+        let mut token = self.peek();
+        match token.literal().as_str() {
+            "(" => self.call(expr),
+            "." => self.maybe_access(expr),
+            "[" => self.maybe_index(expr),
+            "::" => self.maybe_path(expr),
+            "|>" => self.piped(expr),
+            _ => expr,
+        }
+    }
+
+    pub fn maybe_path(&mut self, root: Expr) -> Expr {
+        self.eat_match("::", &mut |parser, b| {
+            if b {
+                let path = parser.next();
+                if let Token::Identifier(..) | Token::Meta(..) = path {
+                    let expr2 = Expr::Path(Box::new(root.to_owned()), path);
+                    parser.maybe_call(&mut |p: &mut Parser| expr2.to_owned())
+                } else {
+                    Expr::Error(
+                        Halt::InvalidInput(format!(
+                            "Invalid path token {} for body {}",
+                            path, root
+                        )),
+                        parser.peek(),
+                    )
+                }
+            } else {
+                root.to_owned()
+            }
+        })
+    }
+
+    pub fn maybe_index(&mut self, body: Expr) -> Expr {
+        self.eat_match("[", &mut |parser, b| {
+            if b {
+                let idx = parser.expression();
+                parser.eat("]");
+                let expr =
+                    Expr::Index(Box::new(body.to_owned()), Box::new(idx));
+                parser.maybe_call(&mut |p2: &mut Parser| expr.to_owned())
+            } else {
+                body.to_owned()
+            }
+        })
+    }
+
+    pub fn maybe_access(&mut self, expr: Expr) -> Expr {
+        self.eat_match(".", &mut |p: &mut Parser, b| {
+            if b {
+                let id = p.next();
+                if let Token::Identifier(..) | Token::Number(..) = id {
+                    let expr2 = Expr::Member(Box::new(expr.to_owned()), id);
+                    p.maybe_call(&mut |p: &mut Parser| expr2.to_owned())
+                } else {
+                    Expr::Error(
+                        Halt::InvalidInput(format!(
+              "Invalid access token {} may not be used in lookups for {}",
+              id, expr
+            )),
+                        p.peek(),
+                    )
+                }
+            } else {
+                expr.to_owned()
+            }
+        })
+    }
+
+    pub fn call(&mut self, expr: Expr) -> Expr {
+        Expr::Call(
+            Box::new(expr.clone()),
+            self.delimited(["(", ",", ")"], &mut Self::expression),
+            match expr {
+                Expr::Literal(id) => Some(id),
+                Expr::Lambda(n, ..) => n,
+                Expr::Call(.., n) => n,
+                Expr::Member(_, n) => Some(n),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn where_binding(&mut self, body: Expr) -> Expr {
+        self.eat("where");
+        let mut pats = vec![];
+        pats.push(self.binding("="));
+        while let Token::Punct(',', _) = self.next() {
+            if self.done() {
+                return Expr::Error(
+                    Halt::Unexpected(format!(
+                        "Collected pats in where clause: {:#?}\n\nUnexpected EOF in incomplete `where` clause due to trailing comma"
+                    , pats)),
+                    self.peek(),
+                );
+            };
+            pats.push(self.binding("="));
+        }
+        Expr::Variable(pats, Box::new(body))
+    }
+
+    pub fn let_binding(&mut self) -> Expr {
+        let args =
+            self.delimited(["let", ",", "in"], &mut |p: &mut Parser| {
+                if matches!(p.peek(), Token::Punct(..) | Token::Identifier(..))
+                {
+                    p.binding("=")
+                } else {
+                    panic!(
+          "Expecting a variable name, but instead got {:?} at {:?}",
+          p.peek(),
+          p.get_pos()
+        )
+                }
+            });
+        Expr::Variable(args, Box::new(self.expression()))
+    }
+
+    fn binding(&mut self, op_literal: &str) -> Binding {
+        let pram = self.parameter();
+        let expr = match self.peek().literal().as_str() {
+            op_literal => self.eat_match(op_literal, &mut |p, b| {
+                if b {
+                    p.expression()
+                } else {
+                    Expr::Nil
+                }
+            }),
+            "," => Expr::Nil,
+        };
+        Binding { pram, expr }
+    }
+
+    fn annotation(&mut self, sep: &str) -> Morpheme {
+        if self.match_literal(sep) {
+            self.eat(sep);
+            self.pattern()
+        } else {
+            Morpheme::Empty
+        }
+    }
+
+    fn pattern(&mut self) -> Morpheme {
+        let token = self.peek();
+        if token.is_right_punct() {
+            Morpheme::Empty
+        } else if !token.is_left_punct() {
+            let morpheme = (if token.match_literal("...") {
+                self.next();
+                if self.peek().is_identifier() {
+                    Morpheme::Rest
+                } else if self.peek().is_meta() {
+                    Morpheme::Meta
+                } else {
+                    |t| Morpheme::Empty
+                }
+                // Morpheme::Rest
+            } else {
+                Morpheme::Atom
+            })(self.next());
+            if self.match_literal("(") {
+                let args = self.delimited(["(", ",", ")"], &mut Self::pattern);
+                Morpheme::Call(token, args)
+            } else {
+                morpheme
+            }
+        } else {
+            let prefix = token.literal();
+            let pats = self.delimited(
+                [&prefix, ",", twin_of(&prefix)],
+                &mut Self::pattern,
+            );
+            match prefix.as_str() {
+                "[" => Morpheme::Vector(pats),
+                "(" => {
+                    if pats.is_empty() {
+                        Morpheme::Empty
+                    } else {
+                        Morpheme::Tuple(pats)
+                    }
+                }
+                "{" => Morpheme::Record(pats),
+                "<" => Morpheme::Iter(pats),
+                _ => Morpheme::Empty,
+            }
+        }
+    }
+
+    fn parameter(&mut self) -> Parameter {
+        let token = self.peek();
+        let shape = Shape::from(token.clone());
+        let name = if token.clone().is_left_punct() {
+            Token::Empty()
+        } else if token.clone().is_identifier() {
+            self.peek()
+        } else {
+            token.clone()
+        };
+        Parameter {
+            name: name.clone(),
+            pattern: self.pattern(),
+            shape: if name == token && shape != Shape::Atom {
+                Shape::Empty
+            } else {
+                shape
+            },
+            kind: self.annotation(":"),
+        }
+    }
+
     pub fn unary(&mut self) -> Expr {
-        if self.match_any_of(&["!", "-"]) {
+        if self.peek().is_unary() {
             let mut op = self.next();
             let right = self.unary();
             Expr::Unary(op, Box::new(right))
@@ -394,48 +522,51 @@ impl<'a> Parser<'a> {
     }
 
     pub fn conditional(&mut self) -> Expr {
-        self.eat("if");
-        let cond = self.expression();
-        self.eat("then");
-        let then = self.expression();
-        let deft = if self.match_literal("else") {
-            self.eat("else");
-            Some(Box::new(self.expression()))
-        } else {
-            None
-        };
-        Expr::Conditional(Box::new(cond), Box::new(then), deft)
+        Expr::Conditional(
+            Box::new({
+                self.eat("if");
+                self.expression()
+            }),
+            Box::new({
+                self.eat("then");
+                self.expression()
+            }),
+            self.eat_match("else", &mut |p, b| {
+                if b {
+                    Some(Box::new(p.expression()))
+                } else {
+                    None
+                }
+            }),
+        )
     }
 
     pub fn function(&mut self) -> Expr {
         self.eat("fn");
-        let name = if let Token::Identifier(n, _) = self.next() {
-            n
+        let name = self.next();
+        if !name.is_identifier() {
+            Expr::Error(
+                Halt::InvalidInput(
+                    "Identifier names must follow the `fn` keyword!"
+                        .to_string(),
+                ),
+                name,
+            )
         } else {
-            let token = self.peek();
-            self.unknown(
-                format!(
-          "Expected a name for the function definition, but instead found {}",
-          token
-        ),
-                Some("|"),
-            );
-            return self.lambda();
-        };
-        match if self.match_any_of(&["|", "||"]) {
-            self.lambda()
-        } else {
-            self.expression()
-        } {
-            Expr::Lambda(_, b, c) => Expr::Lambda(Some(name), b, c),
-            lambda => lambda,
+            match (if self.match_any_of(&["|", "||"]) {
+                self.lambda()
+            } else {
+                self.expression()
+            }) {
+                Expr::Lambda(_, b, c) => Expr::Lambda(Some(name), b, c),
+                lambda => lambda,
+            }
         }
     }
 
     pub fn lambda(&mut self) -> Expr {
-        let name = if let Token::Identifier(t, _) = self.peek() {
-            self.next();
-            Some(t)
+        let name = if self.peek().is_identifier() {
+            Some(self.next())
         } else {
             None
         };
@@ -443,10 +574,28 @@ impl<'a> Parser<'a> {
             self.next();
             vec![]
         } else {
-            self.delimited(("|", ",", "|"), &mut Self::parameter)
+            self.delimited(["|", ",", "|"], &mut Self::parameter)
         };
         let body = self.maybe_block();
         Expr::Lambda(name, prams, Box::new(body))
+    }
+
+    // Haskell style lambdas are curried and inherently anonymous
+    pub fn lambda_alt(&mut self) -> Expr {
+        self.eat("\\");
+        let mut prams = vec![];
+        while !self.match_literal("->") && !self.done() {
+            prams.push(self.parameter());
+            if self.match_literal(",") {
+                self.next();
+            };
+        }
+        self.eat("->");
+        prams.iter().fold(self.expression(), |a, c| {
+            Expr::Lambda(None, vec![c.clone()], Box::new(a))
+        })
+        // ;
+        // Expr::Lambda(None, prams, Box::new(self.expression()))
     }
 
     fn maybe_block(&mut self) -> Expr {
@@ -458,14 +607,15 @@ impl<'a> Parser<'a> {
     }
 
     pub fn block(&mut self) -> Expr {
-        let body = self.delimited(("{", ";", "}"), &mut Self::expression);
+        let is_do = self.eat_match("do", &mut |p, b| b);
+        let body = self.delimited(["{", ";", "}"], &mut Self::expression);
         match body.len() {
             0 => Expr::Nil,
             1 => match body.get(0) {
                 Some(b) => b.to_owned(),
                 None => Expr::Nil,
             },
-            _ => Expr::Block(body.to_owned()),
+            _ => Expr::Block(is_do, body.to_owned()),
         }
     }
 
@@ -480,7 +630,7 @@ impl<'a> Parser<'a> {
             Kind(Token::Empty())
         };
         let body = self
-            .delimited(("{", ",", "}"), &mut |p: &mut Parser| p.binding("="));
+            .delimited(["{", ",", "}"], &mut |p: &mut Parser| p.binding("="));
         Expr::Record(name, body)
     }
 
@@ -519,32 +669,55 @@ impl<'a> Parser<'a> {
     pub fn looping(&mut self) -> Expr {
         self.eat("loop");
         let cond = self.maybe_block();
+        self.ignore(",");
         let body = self.maybe_block();
         Expr::Loop(Box::new(cond), Box::new(body))
     }
 
     pub fn maybe_tuple(&mut self) -> Expr {
-        let expr = if self.match_literal(")") {
-            self.next();
-            return Expr::Nil;
-        } else {
-            self.expression()
-        };
-        match self.peek() {
-            Token::Punct(',', _) => {
-                let mut rest =
-                    self.delimited((",", ",", ")"), &mut Parser::expression);
-                rest.insert(0, expr);
-                Expr::Tuple(rest)
-            }
+        let expr = match self.peek() {
             Token::Punct(')', _) => {
-                self.eat(")");
-                expr
+                self.next();
+                Expr::Nil
             }
-            Token::Operator(x, _) if matches!(x.as_str(), "!" | "-") => {
-                Expr::Unary(self.next(), Box::new(self.unary()))
+            Token::Punct(',', _) => {
+                self.next();
+                if self.match_literal(")") {
+                    self.next();
+                    Expr::Nil
+                } else {
+                    Expr::Error(Halt::Unexpected(format!(
+                        "Expected `)` after `(,` since `(,` is only a valid fragment in `(,)`")), self.peek())
+                }
             }
-            k => panic!("Parentheses not closed! Token: {:?}", k),
+            Token::Punct(':', _) => {
+                self.next();
+                let func = self.expression();
+                let mut args = vec![];
+                while !self.peek().match_literal(")") {
+                    args.push(self.expression());
+                }
+                self.next();
+                return Expr::Call(Box::new(func), args, None);
+            }
+            _ => self.expression(),
+        };
+        if matches!(&expr, Expr::Nil) {
+            return expr;
+        } else {
+            match self.peek() {
+                Token::Punct(',', _) => {
+                    let mut rest =
+                        self.delimited([",", ",", ")"], &mut Self::expression);
+                    rest.insert(0, expr);
+                    Expr::Tuple(rest)
+                }
+                Token::Punct(')', _) => {
+                    self.eat(")");
+                    expr
+                }
+                k => panic!("Parentheses not closed! Token: {:?}", k),
+            }
         }
     }
 
@@ -552,12 +725,12 @@ impl<'a> Parser<'a> {
         let mut ranges = vec![];
         let mut fixed = vec![];
         let mut conds = vec![];
-        let rhs = self.delimited(("|", ",", "]"), &mut |p| {
+        let rhs = self.delimited(["|", ",", "]"], &mut |p| {
       let expr = p.expression();
       if let Expr::Assign(op, b, c) = expr.to_owned() {
         match op.literal().as_str() {
           "<-" => ranges.push((*b, *c)),
-          "=" => fixed.push((*b, *c)),
+          "=" | ":=" => fixed.push((*b, *c)),
           _ =>
           /* TODO */
           {
@@ -593,23 +766,23 @@ impl<'a> Parser<'a> {
                     "|" => p.list_comprehension(item),
                     "," => {
                         let mut expr = p
-                            .delimited((",", ",", "]"), &mut Self::expression);
+                            .delimited([",", ",", "]"], &mut Self::expression);
                         expr.insert(0, item);
-                        Expr::Vector(expr.to_owned())
-                        // p.maybe_index(|_| Expr::Vector(expr.to_owned()))
+                        Expr::Vector(expr)
                     }
                     "]" => {
                         p.eat("]");
-                        Expr::Vector(vec![item.to_owned()])
-                        // p.maybe_index(|_|
-                        // Expr::Vector(vec![item.to_owned()]))
+                        Expr::Vector(vec![item])
                     }
                     _ => {
                         let pos = p.get_pos();
-                        panic!(
-                            "Unable to find closing square bracket {:?}",
-                            pos
-                        );
+                        p.unknown(
+                            format!(
+                                "Unable to find closing square bracket {:?}",
+                                pos
+                            ),
+                            Some("]"),
+                        )
                     }
                 }
             }
@@ -621,48 +794,9 @@ impl<'a> Parser<'a> {
         match prefix.as_str() {
             "_" => Expr::Literal(Token::Symbol(prefix, p)),
             "#" => self.record(),
-            "#'" => {
-                let sym = self.next();
-                match sym {
-                    Token::Number(..)
-                    | Token::Identifier(..)
-                    | Token::Boolean(..)
-                    | Token::Operator(..)
-                    | Token::Keyword(..)
-                    | Token::Meta(..) => {
-                        Expr::Literal(Token::Symbol(sym.literal(), p))
-                    }
-                    Token::Punct(st, _) => {
-                        let st = st.to_string();
-                        let body = self
-                            .delimited((&st, ",", twin_of(&st)), &mut |pr| {
-                                pr.next().literal()
-                            });
-                        Expr::Literal(Token::Symbol(
-                            [
-                                prefix.clone(),
-                                st,
-                                body.join(">"),
-                                twin_of(&prefix).to_string(),
-                            ]
-                            .concat(),
-                            p,
-                        ))
-                    }
-                    Token::Meta(_, _) => todo!(),
-                    _ => {
-                        let curr = self.peek();
-                        self.unknown(
-                            format!(
-                "Unable to finish processing symbol {} and symbol body {}",
-                sym, curr
-              ),
-                            None,
-                        )
-                    }
-                }
+            "`" | "@" => {
+                Expr::Literal(Token::Symbol(self.next().literal(), p))
             }
-            // "`" => todo!(),
             _ => todo!(),
         }
     }
@@ -705,7 +839,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub fn terminal(&mut self) -> Expr {
+    pub fn nonterminal(&mut self) -> Expr {
         let token = self.peek();
         let pos = self.get_pos();
         match token {
@@ -720,6 +854,7 @@ impl<'a> Parser<'a> {
             Token::Operator(x, _) => match x.as_str() {
                 "#" => self.record(),
                 ".." => self.range(None),
+                "\\" => self.lambda_alt(),
                 _ => self.unknown(
                     format!("Unable to parse Operator {:?} at {:?}", x, pos),
                     Some(";"),
@@ -728,13 +863,12 @@ impl<'a> Parser<'a> {
             Token::Keyword(k, _) => match k.as_str() {
                 "if" => self.conditional(),
                 "let" => self.let_binding(),
-                "do" => {
-                    self.next();
-                    self.block()
-                }
+                "do" => self.block(),
                 "case" => self.case(),
                 "loop" => self.looping(),
                 "fn" => self.function(),
+                "data" => self.data(),
+                "const" => self.constant(),
                 _ => self.unknown(
                     format!("Unable to parse Keyword {} at {:?}", k, pos),
                     Some(";"),
@@ -744,158 +878,97 @@ impl<'a> Parser<'a> {
             Token::String(..) | Token::Identifier(..) => {
                 self.next();
                 Expr::Literal(token)
-                // self.maybe_index(|_| Expr::Literal(token.to_owned()))
             }
             Token::Number(..) => {
                 self.next();
                 if self.match_literal("..") {
                     self.range(Some(Expr::Literal(token)))
-                    // self.next();
-                    // let limit = match self.peek() {
-                    //   Token::Number(..) | Token::Identifier(..) => {
-                    //     Some(Box::new(Expr::Literal(self.next())))
-                    //   }
-                    //   _ => None,
-                    // };
-                    // Expr::Iter(Box::new(Expr::Literal(token.clone())),
-                    // limit)
                 } else {
                     Expr::Literal(token.to_owned())
                 }
             }
             Token::Symbol(s, p) => self.symbol(s, p),
-            Token::Char(..)
-            | Token::Meta(..)
-            | Token::Symbol(..)
-            | Token::Boolean(..) => {
+            Token::Char(..) | Token::Symbol(..) | Token::Bool(..) => {
                 self.next();
                 Expr::Literal(token)
             }
+            Token::Meta(s, _) => self.named(s),
             _ => {
                 let msg = format!("Unable to parse {:?} at {:?}", token, pos);
                 self.unknown(
                     format!("Unable to parse {:?} at {:?}", token, pos),
                     Some(";"),
-                );
-                panic!(msg)
+                )
             }
         }
     }
 
-    pub fn maybe_where<F: FnMut(&mut Self) -> Expr>(
-        &mut self,
-        mut parse: F,
-    ) -> Expr {
-        let expr = parse(self);
-        if self.match_literal("where") {
-            self.where_binding(expr)
-        } else {
-            expr
+    pub fn constant(&mut self) -> Expr {
+        self.eat("const");
+        let mut constants = vec![];
+        constants.push(self.binding("="));
+        while self.next().match_literal(",") {
+            constants.push(self.binding("="));
         }
+        Expr::Constant(constants)
     }
 
-    pub fn where_binding(&mut self, body: Expr) -> Expr {
-        self.eat("where");
-        let mut pats = vec![];
-        pats.push(self.binding("="));
-        while let Token::Punct(',', _) = self.next() {
-            if self.done() {
-                return Expr::Error(
-                    Halt::Unexpected(format!(
-                        "Collected pats in where clause: {:?}\n\nUnexpected EOF in incomplete `where` clause"
-                    , pats)),
-                    self.peek(),
-                );
-            };
-            pats.push(self.binding("="));
+    pub fn piped(&mut self, arg: Expr) -> Expr {
+        let mut pipes = vec![];
+        while self.next().match_literal("|>") {
+            pipes.push(self.expression());
         }
-        Expr::Variable(pats, Box::new(body))
+        Expr::Pipe(Box::new(arg), pipes)
     }
 
-    pub fn let_binding(&mut self) -> Expr {
-        let args =
-            self.delimited(("let", ",", "in"), &mut |p: &mut Parser| {
-                if matches!(p.peek(), Token::Punct(..) | Token::Identifier(..))
-                {
-                    p.binding("=")
+    pub fn named(&mut self, ty: String) -> Expr {
+        Expr::Named(
+            Kind(self.next()),
+            Box::new({
+                let tok = self.peek();
+                if self.lexer.has_meta(&format!("{} {}", ty, tok.literal())) {
+                    Expr::Named(Kind(tok), Box::new(self.expression()))
                 } else {
-                    panic!(
-          "Expecting a variable name, but instead got {:?} at {:?}",
-          p.peek(),
-          p.get_pos()
-        )
-                }
-            });
-        Expr::Variable(args, Box::new(self.expression()))
-    }
-
-    fn binding(&mut self, op_literal: &str) -> Binding {
-        Binding {
-            pram: self.parameter(),
-            expr: self.eat_match(op_literal, &mut |p, b| {
-                if b {
-                    p.expression()
-                } else {
-                    Expr::Nil
+                    self.expression()
                 }
             }),
+        )
+    }
+
+    pub fn data(&mut self) -> Expr {
+        self.eat("data");
+        // let name = self.next();
+        if let Some(n) = self.lexer.id_as_meta() {
+            let name = n;
+            self.next();
+            self.eat("::");
+            let variants = self.delimited(["{", "|", "}"], &mut Self::variant);
+            Expr::Data(Kind(name), variants)
+        } else {
+            let tok = self.peek();
+            Expr::Error(
+                Halt::Unexpected(format!(
+                    "Expected data type identifier, but found `{}` instead",
+                    tok
+                )),
+                tok,
+            )
         }
     }
 
-    fn annotation(&mut self) -> Vec<Token> {
-        self.eat_match(":", &mut |p1, b| {
-            if b {
-                match p1.maybe_delimited(Some(","), &mut |p2: &mut Parser| {
-                    p2.next()
-                }) {
-                    Either::Left(x) => vec![x],
-                    Either::Right(x) => x,
-                }
-            } else {
-                vec![]
+    fn variant(&mut self) -> DataVariant {
+        let name = self.next();
+        if self.match_literal("|") {
+            DataVariant {
+                ident: Kind(name),
+                items: vec![],
             }
-        })
-    }
-
-    fn pattern(&mut self) -> Lexeme {
-        let token = self.peek();
-        if !token.is_left_punct() {
-            Lexeme::Atom(self.next())
         } else {
-            let prefix = token.literal();
-            let pats = self.delimited(
-                (&prefix, ",", twin_of(&prefix)),
-                &mut Self::pattern,
-            );
-            match prefix.as_str() {
-                "[" => Lexeme::Vector(pats),
-                "(" => Lexeme::Tuple(pats),
-                "{" => Lexeme::Record(pats),
-                "<" => Lexeme::Iter(pats),
-                _ => Lexeme::Empty,
+            let pattern = self.pattern();
+            DataVariant {
+                ident: Kind(name),
+                items: vec![pattern],
             }
-        }
-    }
-
-    fn parameter(&mut self) -> Parameter {
-        let token = self.peek();
-        let shape = Shape::from(token.clone());
-        let name = if token.clone().is_left_punct() {
-            Token::Empty()
-        } else if token.clone().is_identifier() {
-            self.peek()
-        } else {
-            token.clone()
-        };
-        Parameter {
-            name: name.clone(),
-            pattern: self.pattern(),
-            shape: if name == token && shape != Shape::Atom {
-                Shape::Empty
-            } else {
-                shape
-            },
-            kind: self.annotation(),
         }
     }
 
@@ -936,7 +1009,7 @@ impl<'a> Parser<'a> {
                 self.peek(),
             )
         } else {
-            self.expression()
+            panic!("{:#?}", self)
         }
     }
 }
@@ -948,7 +1021,7 @@ pub fn parse_input(src: &str) -> Expr {
 
 #[cfg(test)]
 mod tests {
-    use crate::log_do;
+    use crate::{core::rygtype::RygType, log_do};
 
     use super::*;
     fn inspect_tokens(src: &str) {
@@ -993,10 +1066,17 @@ mod tests {
         let src = "a <- (b <- c)"; //"1 + 2 / 3 * (4 ** 5 / 6)";
         log_do!(
           // "bin_right" => Parser::new(src).bin_right(0, &mut Parser::expression),
-          "default (left)" => Parser::new(src).parse(),
+          "default (left)" => Parser::new(src).parse()
           // "(both) bin_direct" => Parser::new(src).bin_direct(0, &mut Parser::expression)
         );
         // inspect_expr(src)
+    }
+
+    #[test]
+    fn inspect_new_line() {
+        let src = "x = 1
+        y = 2";
+        parse(src);
     }
 
     #[test]
@@ -1020,7 +1100,7 @@ mod tests {
 
     #[test]
     fn inspect_record() {
-        let src = "#{a = b + 1, c = d};";
+        let src = "#{a: A = b + 1, c: C = d};";
         inspect_tokens(src);
         parse(src);
     }
@@ -1028,7 +1108,7 @@ mod tests {
     #[test]
     fn inspect_loop() {
         let src = "loop a {b; c; d} + 3"; //"a =< b =< |c| a ** b";
-        let src = "loop || let t = i += 1 in t; { print'ln(t) };";
+        let src = "loop || let t = i += 1 in t { print'ln(t) };";
         parse(src);
         inspect_expr(src);
     }
@@ -1071,7 +1151,7 @@ mod tests {
 
     #[test]
     fn member_access() {
-        let src = "-foo.bar.baz(x, y);";
+        let src = "-foo.bar.baz(x, y)";
         inspect_expr(src);
     }
 
@@ -1089,5 +1169,43 @@ mod tests {
         .iter()
         .for_each(|s| inspect_expr(s))
         // inspect_expr(src);
+    }
+
+    // #[test]
+    // fn ten_k_sums() {
+    //     let src = (0..)
+    //         .take_while(|n| *n < 10 * 57)
+    //         .map(|n| n.to_string())
+    //         .collect::<Vec<_>>()
+    //         .join(" + ");
+    //     // println!("{}", src);
+    //     log_do!(
+    //         "length" => &src.len()
+    //     );
+    //     let ast = parse_input(&src);
+    //     // println!("{:#?}", &ast)
+    // }
+
+    #[test]
+    fn inspect_data() {
+        let src = "data Womp :: { 
+            A a 
+            | B (b, b') 
+            | C  
+            | D (Int, Float) 
+            | E {a, b} 
+        }";
+        inspect_expr(src)
+    }
+
+    #[test]
+    fn expr_ty() {
+        let src = "3 + 4";
+        let ast = parse_input(src);
+        let ty = RygType::from(ast.clone());
+        log_do!(
+            "3 + 4" => ast,
+            "type'of Expr(3 + 4)" => ty
+        )
     }
 }
