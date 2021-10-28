@@ -1,0 +1,13 @@
+fizzbuzz 
+  where 
+    fizzbuzz = let 
+      i = 1 
+    in 
+      loop (i += 1) < 101 
+      print'ln(case true of {
+        i % 15 == 0 => "Fizzbuzz",
+        i % 3 == 0 => "Fizz",
+        i % 5 == 0 => "Buzz",
+        _ => i
+      });
+      
