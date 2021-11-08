@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt::Write, i64};
 use crate::util::types::Kind;
 
 pub use super::{
+    literal::Literal,
     stream::{CharStream, Pos, Stream, Streaming},
     token::Token,
 };
@@ -41,30 +42,18 @@ impl<'a> Streaming for Lexer<'a> {
     }
 
     fn done(&mut self) -> bool {
-        if let Some(t) = self.current.clone() {
-            t.is_eof() || self.src.done()
-        } else {
-            self.src.peek().is_none()
-        }
+        self.queue.is_empty()
+            && (if let Some(t) = self.current.clone() {
+                t.is_eof() || self.src.done()
+            } else {
+                self.src.peek().is_none()
+            })
     }
     fn get_pos(&mut self) -> Pos {
         self.src.pos.clone()
     }
 }
 
-pub trait ToLiteral {
-    type Output;
-    fn literal(&self) -> Self::Output;
-}
-
-impl ToLiteral for Token {
-    type Output = String;
-    fn literal(&self) -> Self::Output {
-        Token::literal(&self)
-    }
-}
-
-#[allow(unused)]
 impl<'a> Lexer<'a> {
     pub fn new(src: &str) -> Lexer {
         Lexer {
@@ -75,6 +64,11 @@ impl<'a> Lexer<'a> {
             comments: vec![],
             known: HashSet::new(),
         }
+    }
+
+    pub fn extend(&mut self, src: &'a str) {
+        let extended = self.src.extend(src);
+        self.src = extended;
     }
 
     pub fn register_meta(&mut self, word: &str) {
@@ -110,10 +104,28 @@ impl<'a> Lexer<'a> {
         self.depth.len()
     }
 
-    fn eat_while<F: FnMut(char) -> bool>(&mut self, mut pred: F) -> String {
+    fn eat_while<F>(&mut self, mut pred: F) -> String
+    where
+        F: FnMut(char) -> bool, {
         let mut word = String::new();
+        // Since `self.peek()` only returns `None` when done, and since
+        // `self.next()` returns the *same* token as `self.peek()` while
+        // advancing the iterator, it follows that we can call unwrap on either
+        // methods without panic iff `self.src.done()` returns `false`.
         while !self.src.done() && pred(self.src.peek().unwrap()) {
             word.push(self.src.next().unwrap());
+        }
+        word
+    }
+
+    fn eat_while_counting<F>(&mut self, mut pred: F) -> String
+    where
+        F: FnMut(char, usize) -> bool, {
+        let mut count = 0_usize;
+        let mut word = String::new();
+        while !self.src.done() && pred(self.src.peek().unwrap(), count) {
+            word.push(self.src.next().unwrap());
+            count += 1;
         }
         word
     }
@@ -122,7 +134,7 @@ impl<'a> Lexer<'a> {
         if let Some(tok) = self.queue.pop() {
             return tok;
         };
-        self.eat_while(char::is_whitespace);
+        self.eat_whitespace();
         let ch = self.src.peek();
         if self.src.done() {
             return Token::Eof(self.get_pos());
@@ -136,7 +148,7 @@ impl<'a> Lexer<'a> {
                 ':' => self.colon(pos),
                 x @ ('#' | '@' | '`') => self.symbol(*x, pos),
                 x if is_digit(*x) => self.number(),
-                x if starts_name(*x) || x == &'_' => self.identifier(),
+                x if starts_identifier(*x) || x == &'_' => self.identifier(),
                 x if is_punct(*x) => self.punct(*c, pos),
                 x if is_op_char(*x) => self.operator(*x, pos),
                 _ => Token::Invalid(
@@ -154,6 +166,12 @@ impl<'a> Lexer<'a> {
 
     fn symbol(&mut self, ch: char, pos: Pos) -> Token {
         self.src.next();
+        // match (ch == '#', self.src.peek()) {
+        //     Some('\'') => {}
+        //     Some('!') => {}
+        //     Some('[') => {}
+        //     _ => {}
+        // }
         if ch == '#' && matches!(self.src.peek(), Some('\'')) {
             self.src.next();
             Token::Symbol("#'".into(), pos)
@@ -168,23 +186,26 @@ impl<'a> Lexer<'a> {
         if let Some(punct @ '|') = self.src.peek() {
             self.queue.push(Token::Punct(punct, p));
             self.src.next();
-        } else {
-            match ch {
-                // left punct (`)`, `]`, `}`) adds corresponding right punct to
-                // depth stack this corresponds to each group
-                // surrounded by parens/brackets/braces depth
-                // stack should be empty when reaching EOF
-                x if Punct::is_left(x) => self.depth.push(Punct::twin_of(x)),
-                // right punct to be popped off depth stack when encountered
-                x if Punct::is_right(x) => {
-                    if let Some(x) = self.depth.last() {
-                        self.depth.pop();
-                    }
-                }
-                _ => {}
-            };
+        };
+
+        match ch {
+            // left punct (`)`, `]`, `}`) adds corresponding right punct to
+            // depth stack this corresponds to each group
+            // surrounded by parens/brackets/braces depth
+            // stack should be empty when reaching EOF
+            x if Punct::is_left(x) => {
+                self.depth.push(Punct::twin_of(x));
+                Token::Open(ch, pos)
+            }
+            // right punct to be popped off depth stack when encountered
+            x if Punct::is_right(x) => {
+                if let Some(x) = self.depth.last() {
+                    self.depth.pop();
+                };
+                Token::Closed(ch, pos)
+            }
+            _ => Token::Punct(ch, pos),
         }
-        Token::Punct(ch, pos)
     }
 
     fn colon(&mut self, pos: Pos) -> Token {
@@ -297,9 +318,9 @@ impl<'a> Lexer<'a> {
     fn identifier(&mut self) -> Token {
         let mut word = String::new();
         let pos = self.get_pos();
-        word.push_str(&self.eat_while(|c| is_name(&c.to_string())));
+        word.push_str(&self.eat_while(|c| is_identifier(&c.to_string())));
         match word.as_str() {
-            "true" | "false" => Token::Bool(word, pos),
+            "true" | "false" => Token::Bool(word == "true", pos),
             "_" => Token::Symbol(word, pos),
             w if is_kw(w) => {
                 let tok = Token::Keyword(w.to_string(), pos.clone());
@@ -309,10 +330,15 @@ impl<'a> Lexer<'a> {
                     tok
                 }
             }
-            w if is_built_in(w) || self.known.contains(w) => {
+            w if is_built_in(w)
+                || self.known.contains(w)
+                || self.has_meta(&w.to_string()) =>
+            {
                 Token::Meta(w.to_string(), pos)
             }
-            w if is_name(&word)
+            // lex as operators certain tokens that would be otherwise
+            // considered keywords or identifiers (e.g., `mod`, etc.)
+            w if is_identifier(&word)
                 && Token::Keyword(word.clone(), pos.clone())
                     .as_operator()
                     .is_some() =>
@@ -326,14 +352,16 @@ impl<'a> Lexer<'a> {
     fn character(&mut self) -> Token {
         let pos = self.get_pos();
         let mut escaped = false;
-        let mut e_ct = 0;
+        let mut esc_count = 0;
         let mut chr: char = self.src.peek().map_or_else(|| '\0', |c| c);
         let mut key: u8 = chr as u8;
+        let mut first = false;
+        let mut quote = false;
         self.src.next();
-        let wrd = self.eat_while(|c| {
+        let wrd = self.eat_while_counting(|c, i| {
             let ctn = match (escaped, c) {
                 (false, '\\') => {
-                    e_ct = e_ct + 1;
+                    esc_count += 1;
                     escaped = true;
                     true
                 }
@@ -352,18 +380,21 @@ impl<'a> Lexer<'a> {
                     false
                 }
                 (false, e) => {
-                    if e_ct == 0 {
+                    if esc_count == 0 {
                         chr = e;
                         key = chr as u8;
                     };
                     false
                 }
             };
-            ctn
+            ctn && i < 3
         });
+        if quote {
+            return Token::Symbol("'".to_string(), pos);
+        };
         let cx = self.src.next();
         let pos = self.get_pos();
-        if e_ct > 2 || !matches!(self.src.next(), Some('\'')) {
+        if esc_count > 2 || !matches!(self.src.next(), Some('\'')) {
             let mut mischar = chr.to_string();
             if let Some(cr) = cx {
                 mischar.push(cr);
@@ -381,10 +412,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             Token::Invalid(
-                format!(
-                    "The input {:?}{:?} is not a valid character",
-                    chr, mischar
-                ),
+                format!("The input `{:?}` is not a valid character", mischar),
                 pos,
             )
         } else {
@@ -392,22 +420,35 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn eat_whitespace(&mut self) {
+        self.eat_while(char::is_whitespace);
+    }
+
     fn escaped(&mut self, end: &char) -> String {
         let mut escaped = false;
         let mut word = String::new();
         self.src.next();
+        let mut pos = self.get_pos();
         while !self.done() {
             if let Some(c) = self.src.next() {
                 if escaped {
                     escaped = false;
-                    // word.push(c);
                     match c {
                         esc if is_escapable(esc) => {
                             word.push(get_escaped(esc))
                         }
                         // TODO: parsing unicode escapes
-                        // 'u' => unicode(self).1 as ,
+                        // 'u' => {
+                        //     let (s, n) = unicode(self);
+                        //     println!("{}",);
+                        // }
                         '\0' => { /* null grapheme */ }
+                        // preserve indentation/ignore whitespace on new line
+                        // e.g. `"a b c\
+                        //        d e"` lexes as "a b cd e"
+                        '\n' => {
+                            self.eat_whitespace();
+                        }
                         _ => {
                             word.push(c);
                         }
@@ -415,6 +456,7 @@ impl<'a> Lexer<'a> {
                 } else if &c == end {
                     break;
                 } else if &c == &'\\' {
+                    pos = self.get_pos();
                     escaped = true;
                 } else {
                     word.push(c);
@@ -424,95 +466,129 @@ impl<'a> Lexer<'a> {
         word
     }
 
-    fn number(&mut self) -> Token {
+    pub fn maybe_digits(&mut self) -> Token {
+        // digits only, used for tuple field access
         let pos = self.get_pos();
+        match self.src.peek() {
+            Some(c) if is_digit(c) => {
+                let digits = self.eat_while(is_digit);
+                Token::Number(digits, 0, pos)
+            }
+            _ => self.token(),
+        }
+    }
+    fn number(&mut self) -> Token {
+        let start = self.get_pos();
         let mut infixed = false;
-        let mut base: u8 = 0;
+        let mut radix: u8 = 0;
         let mut setting: fn(char) -> bool = is_digit;
         let mut seps = 0;
         let mut dot_ct = 0;
         let zero_first = matches!(self.src.peek(), Some('0'));
-        let mut number = self.eat_while(|c| -> bool {
-            match c {
-                '_' => true,
-                '.' => {
-                    dot_ct = dot_ct + 1;
-                    if infixed {
-                        return false;
-                    } else {
-                        infixed = true;
-                        base = 10;
-                        return true;
+        let mut prefixed = false;
+        let mut error_msg = String::new();
+        // since this method is triggered by recognizing a digit, the dot_idx
+        // should never be 0, hence the safety of using 0 as a default value
+        // let mut dot_idx = 0;
+        let mut number = self.eat_while_counting(|c, i| -> bool {
+            if c == '_' {
+                return true;
+            };
+            match radix {
+                2 => is_bin(c),
+                8 => is_oct(c),
+                16 => is_hex(c),
+                10 => match c {
+                    '+' | '-' => infixed,
+                    '.' if dot_ct == 1 && !infixed => {
+                        radix = 0;
+                        dot_ct += 1;
+                        false
                     }
-                }
-                'b' | 'o' | 'x' => {
-                    if infixed {
-                        return false;
-                    } else {
-                        infixed = true;
+                    _ => is_digit(c),
+                },
+                // 0 => {}
+                _ => match c {
+                    '.' => {
+                        dot_ct += 1;
+                        if infixed {
+                            return false;
+                        } else {
+                            // infixed = true;
+                            radix = 10;
+                            return true;
+                        }
+                    }
+                    'b' | 'B' | 'o' | 'O' | 'x' | 'X'
+                        if zero_first && i == 1 =>
+                    {
+                        prefixed = true;
                         match c {
-                            'b' => {
-                                base = 2;
-                                setting = is_bin;
+                            'b' | 'B' => {
+                                radix = 2;
                             }
-                            'o' => {
-                                base = 8;
-                                setting = is_oct;
+                            'o' | 'O' => {
+                                radix = 8;
                             }
-                            'x' => {
-                                base = 16;
-                                setting = is_hex;
+                            'x' | 'X' => {
+                                radix = 16;
                             }
                             _ => unreachable!(),
                         };
-                        return true;
+                        true
                     }
-                }
-                'e' => {
-                    if infixed {
-                        return false;
-                    } else {
-                        infixed = true;
-                        base = 10;
-                        return true;
+                    'e' | 'E' if !prefixed => {
+                        if infixed {
+                            return false;
+                        } else {
+                            infixed = true;
+                            radix = 10;
+                            return true;
+                        }
                     }
-                }
-                '+' | '-' => 10 == base || !infixed,
-                _ => setting(c),
+                    _ => is_digit(c),
+                },
             }
         });
         if dot_ct == 2 {
-            let mut pos2 = pos.clone();
             let num = Token::Number(
                 number.replace('_', "").trim_end_matches('.').to_string(),
                 0,
-                pos,
+                start.clone(),
             );
-            let should_be_dot = self.src.peek();
-            if let Some(point @ '.') = self.src.peek() {
-                pos2.next(&point);
-                self.src.next();
-                if let Some(point) = self.src.peek() {
-                    self.src.next();
-                    self.queue.push(Token::Operator("...".to_string(), pos2));
-                } else {
-                    self.queue.push(Token::Operator("..".to_string(), pos2));
+            let curr = self.src.peek();
+            let dots = self.eat_while(|c| c == '.');
+            let Pos {
+                pos,
+                row,
+                col,
+                diff_line,
+            } = self.get_pos();
+            let dotpos = Pos {
+                pos: start.clone().pos + dots.len(),
+                row,
+                col: start.col + dots.len(),
+                diff_line,
+            };
+            match dots.len() {
+                1 | 2 => {
+                    self.queue.push(Token::Operator(format!(".{}", dots), dotpos));
+                    num
                 }
-                self.src.pos.next(&'.');
-                num
-            } else {
-                Token::Invalid(format!("Invalid sequence! Expected a second `.`, after '{}', but instead got {:?}", num, should_be_dot), self.get_pos())
+                _ => {
+                   Token::Invalid(format!("Invalid sequence! Expected a second `.`, after '{:?}', but instead got {:?}", num, curr), self.get_pos())
+                }
             }
         } else {
             Token::Number(
-                if matches!(base, 2 | 8 | 16) && number.len() > 2 {
+                if matches!(radix, 2 | 8 | 16) && number.len() > 2 {
                     number[2..].to_owned()
                 } else {
                     number
                 }
                 .replace('_', ""),
-                base,
-                pos,
+                radix,
+                start,
             )
         }
     }
@@ -553,16 +629,16 @@ pub fn integer(word: &str, base: u32) -> i32 {
     }
 }
 
-pub fn starts_name(c: char) -> bool {
+pub fn starts_identifier(c: char) -> bool {
     (c.is_alphabetic() || matches!(c, '$' | '_'))
         && !matches!(c, '@' | '\'' | '0'..='9')
 }
 
-pub fn is_name(word: &String) -> bool {
-    let all = word.chars().fold(true, |a, c| {
-        a && (c.is_alphanumeric() || matches!(c, '\'' | '_' | '$'))
-    });
-    word.starts_with(char::is_alphabetic) || all
+pub fn is_identifier(word: &String) -> bool {
+    word.starts_with(char::is_alphabetic)
+        || word.chars().fold(true, |a, c| {
+            a && (c.is_alphanumeric() || matches!(c, '\'' | '_' | '$'))
+        })
 }
 
 pub fn is_escapable(c: char) -> bool {
@@ -697,13 +773,13 @@ pub fn is_op_char(c: char) -> bool {
             | '>'
             | '|'
             | '&'
-            | '@'
+            // | '@'
             | '!'
             | '~'
             | '?'
             | ':'
             | '\\'
-            | '$'
+            // | '$'
             | '.' // single only => punct
     )
 }
@@ -732,7 +808,9 @@ pub fn is_oct(c: char) -> bool {
 }
 
 pub fn is_hex(c: char) -> bool {
-    c.is_ascii_hexdigit()
+    // matches!(c.to_lowercase().next().unwrap(), '0'..='9' | 'a'..='f')
+    c.is_digit(16)
+    // c.is_ascii_hexdigit()
 }
 
 // not all of these are implemented, but stay reserved
@@ -740,13 +818,9 @@ pub fn is_kw(s: &str) -> bool {
     matches!(
         s,
         "do" | "let"
-            // | "var"
-            | "if"
+             | "if"
             | "then"
             | "else"
-            | "true"
-            | "false"
-            | "at"
             | "in"
             | "case"
             | "of"
@@ -761,11 +835,10 @@ pub fn is_kw(s: &str) -> bool {
             | "and"
             | "or"
             | "xor"
-            | "nor"
             | "not"
             | "mod"
             | "loop"
-            | "like" // | "set" // | "get"
+            | "struct"
     )
 }
 
@@ -847,7 +920,7 @@ mod test {
 
     #[test]
     fn from_to() {
-        let src = "3..14";
+        let src = "3..14 7_9 34e+3...9";
         inspect_tokens(src);
         let mut lexer = Lexer::new(src);
         assert_eq!(
@@ -888,7 +961,8 @@ mod test {
 
     #[test]
     fn escaped_str() {
-        let src = "a\nb";
+        let src = "\"a\nb \
+           c d\"";
         inspect_tokens(src);
     }
 
