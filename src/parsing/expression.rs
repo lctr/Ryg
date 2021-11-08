@@ -1,163 +1,27 @@
 use std::{
     collections::HashSet,
     fmt::{self, Debug},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
+pub use super::morpheme::Morpheme;
+
 use crate::{
-    core::rygtype::Field,
-    simple_pub_struct,
+    core::{function::ArgList, rygtype::Field},
+    quick_match, simple_pub_struct,
     tok::{
-        lexer::{Pos, ToLiteral},
-        token::{Assoc, Token},
+        lexer::{Literal, Pos, Token},
+        token::{AssignOp, Assoc, BinOp, FromToken, UnOp},
     },
     util::{
         display::map_join,
         state::Halt,
-        types::{Either, Kind},
+        types::{Either, Kind, Maybe},
     },
 };
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Morpheme {
-    Empty,
-    Rest(Token),
-    Meta(Token),
-    Atom(Token),
-    Tuple(Vec<Morpheme>),
-    Vector(Vec<Morpheme>),
-    Record(Vec<Morpheme>),
-    Iter(Vec<Morpheme>),
-    Call(Token, Vec<Morpheme>),
-    Unary(Token, Box<Morpheme>),
-    // for default parameters,
-    Binary(Token, Box<Morpheme>, Box<Morpheme>),
-}
-
-impl Morpheme {
-    pub fn get_tokens<'t>(&'t self) -> Vec<&'t Token> {
-        let mut acc = vec![];
-        match self {
-            Morpheme::Empty => {}
-            Morpheme::Meta(t) => {
-                // for tk in t.get_tokens() {
-                //     acc.push(tk)
-                // }
-                acc.push(t)
-            }
-            Morpheme::Atom(t) => {
-                acc.push(t);
-            }
-            Morpheme::Tuple(ts)
-            | Morpheme::Vector(ts)
-            | Morpheme::Iter(ts)
-            | Morpheme::Record(ts) => ts.iter().for_each(|tp| {
-                tp.get_tokens().iter().for_each(|t| acc.push(*t))
-            }),
-            Morpheme::Call(a, bs) => {
-                acc.push(a);
-                bs.iter().for_each(|tp| {
-                    tp.get_tokens().into_iter().for_each(|t| acc.push(t));
-                })
-            }
-            Morpheme::Unary(t, b) => {
-                acc.push(t);
-                b.get_tokens().into_iter().for_each(|t| acc.push(t));
-            }
-            Morpheme::Binary(t, b, c) => {
-                acc.push(t);
-                b.get_tokens().iter().for_each(|t| acc.push(*t));
-                c.get_tokens().iter().for_each(|t| acc.push(*t));
-            }
-            Morpheme::Rest(t) => acc.push(t),
-        };
-        acc
-    }
-    pub fn has_rest(&self) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::Rest(_) => true,
-            Self::Meta(_) => false,
-            Self::Atom(_) => false,
-            Self::Tuple(ms)
-            | Self::Vector(ms)
-            | Self::Record(ms)
-            | Self::Call(_, ms)
-            | Self::Iter(ms) => ms.iter().any(Self::has_rest),
-            Self::Unary(o, m) => Self::has_rest(&**m),
-            Self::Binary(o, n, m) => {
-                Self::has_rest(&**n) || Self::has_rest(&**m)
-            }
-        }
-    }
-}
-
-impl From<&Morpheme> for Expr {
-    fn from(tp: &Morpheme) -> Self {
-        Self::from(tp.clone())
-    }
-}
-
-impl From<Morpheme> for Expr {
-    fn from(tokpat: Morpheme) -> Self {
-        match tokpat {
-            Morpheme::Empty => Expr::Nil,
-            // figure this out for rest parameters
-            Morpheme::Meta(t) => Expr::Vector(vec![]),
-            Morpheme::Atom(t) => Expr::Literal(t),
-            Morpheme::Iter(vs) => Expr::Named(
-                Kind(Token::Meta("Iter".to_string(), Pos::faux())),
-                Box::new(Expr::Vector(
-                    vs.iter().map(|tp| Expr::from(tp)).collect::<Vec<_>>(),
-                )),
-            ),
-            Morpheme::Vector(vs) => Expr::Vector(
-                vs.iter()
-                    .map(|v| Expr::from(v.to_owned()))
-                    .collect::<Vec<_>>(),
-            ),
-            Morpheme::Tuple(vs) => Expr::Tuple(
-                vs.iter()
-                    .map(|v| Expr::from(v.to_owned()))
-                    .collect::<Vec<_>>(),
-            ),
-            Morpheme::Record(vs) => Expr::Record(
-                Kind(Token::Empty()),
-                vs.iter()
-                    .map(|v| {
-                        let toks = v.get_tokens();
-                        Binding {
-                            pram: Parameter {
-                                name: Token::Empty(),
-                                pattern: v.to_owned(),
-                                shape: Shape::Record,
-                                kind: v.clone(),
-                            },
-                            expr: Expr::from(v.to_owned()),
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            Morpheme::Call(n, a) => Expr::Call(
-                Box::new(Expr::Literal(n)),
-                a.iter().map(|v| Expr::from(v.clone())).collect::<Vec<_>>(),
-                None,
-            ),
-            Morpheme::Unary(t, p) => Expr::Unary(t, Box::new(Expr::from(*p))),
-            Morpheme::Binary(t, a, b) => Expr::Binary(
-                t,
-                Box::new(Expr::from(*a)),
-                Box::new(Expr::from(*b)),
-            ),
-            Morpheme::Rest(t) => Expr::Literal(t),
-            /* TokPattern::Ternary(_, _, _, _) => todo!(),
-             * TokPattern::Map(_, _) => todo!(), */
-        }
-    }
-}
-
 #[allow(unused)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Program {
     pub name: Option<String>,
     pub body: Vec<Expr>,
@@ -180,66 +44,415 @@ impl Program {
     }
 }
 
-#[allow(unused)]
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.body.iter()).finish()
+    }
+}
+
+pub struct Binary<X> {
+    op: BinOp,
+    left: Rc<X>,
+    right: Rc<X>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unary<X> {
+    op: UnOp,
+    expr: Rc<X>,
+}
+
+impl<X> Unary<X> {
+    pub fn visit<F, G, T>(&self, f: F) -> T
+    where
+        F: Fn(UnOp) -> G,
+        G: Fn(Rc<X>) -> T, {
+        let op = self.op;
+        let expr = self.expr.clone();
+        f(op)(expr)
+    }
+
+    pub fn walk<F, G, T, U>(&self, f: F, mut u: &mut U) -> T
+    where
+        F: Fn(UnOp) -> G,
+        G: Fn(Rc<X>, &mut U) -> T, {
+        let op = self.op;
+        let expr = self.expr.clone();
+        f(op)(expr, &mut u)
+    }
+}
+
+impl From<(Token, Expr)> for Unary<Expr> {
+    fn from((t, x): (Token, Expr)) -> Self {
+        let op = match t.literal().as_str() {
+            "!" => UnOp::Not,
+            "-" => UnOp::Neg,
+            "&" => UnOp::Ref,
+            "*" => UnOp::Deref,
+            "~" => UnOp::BitNot,
+            // TODO: custom unary ops? or error handling
+            _ => todo!(),
+        };
+        let expr = Rc::new(x);
+        Self { op, expr }
+    }
+}
+
+impl From<(UnOp, Expr)> for Unary<Expr> {
+    fn from((t, x): (UnOp, Expr)) -> Self {
+        let op = t;
+        let expr = Rc::new(x);
+        Self { op, expr }
+    }
+}
+
+pub struct AssignExpr {}
+pub struct BinaryExpr {
+    op: BinOp,
+    left: Rc<Expr>,
+    right: Rc<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupExpr(Weak<Expr>);
+impl Literal for SupExpr {
+    type Lit = String;
+    fn literal(&self) -> Self::Lit {
+        match self.0.upgrade() {
+            Some(expr) => expr.literal(),
+            None => String::from("\n~~ EMPTY SUPEXPR\n"),
+        }
+    }
+}
+impl std::cmp::PartialEq for SupExpr {
+    fn ne(&self, other: &Self) -> bool {
+        // self.0.ptr_eq(&other.0)
+        // ???
+        self.0.strong_count() == 0 || self.0.strong_count() == 0
+    }
+
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+            && self.0.strong_count() > 0
+            && other.0.strong_count() > 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Assign(Token, Box<Expr>, Box<Expr>),
-    Binary(Token, Box<Expr>, Box<Expr>),
-    Block(bool, Vec<Expr>),
-    Call(Box<Expr>, Vec<Expr>, Option<Token>),
-    // Case(Box<Expr>, Vec<(TokPattern, Expr)>, Box<Expr>),
-    Case(Box<Expr>, Vec<(Expr, Expr)>, Box<Expr>),
-    Conditional(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+    Assign(AssignOp, Box<Self>, Box<Self>),
+    Binary(BinOp, Box<Self>, Box<Self>),
+    Block(Token, Vec<Self>),
+    Call(Box<Self>, Vec<Self>, Option<Token>),
+    Case(Box<Self>, Vec<(Self, Self)>, Box<Self>),
+    Conditional(Box<Self>, Box<Self>, Option<Box<Self>>),
     Constant(Vec<Binding>),
-    Data(Kind<Token>, Vec<DataVariant>),
+    Data(Kind<Token>, Vec<Variant>),
+    Empty,
     Error(Halt, Token),
-    Index(Box<Expr>, Box<Expr>),
-    Iter(Box<Expr>, Option<Box<Expr>>),
-    Lambda(Option<Token>, Vec<Parameter>, Box<Expr>),
+    Ident(Token, SupExpr),
+    Index(Box<Self>, Box<Self>),
+    Instance(Token, Vec<(Token, Self)>),
+    Iter(Box<Self>, Option<Box<Self>>),
+    Lambda(Vec<Parameter>, Box<Self>),
+    Function(
+        Token,
+        Vec<Parameter>,
+        Option<Box<Morpheme<Token, Expr>>>,
+        Box<Self>,
+    ),
     List(Box<Definition>),
     Literal(Token),
-    Loop(Box<Expr>, Box<Expr>),
-    Member(Box<Expr>, Token),
-    Named(Kind<Token>, Box<Expr>),
-    Nil,
-    Path(Box<Expr>, Token),
-    Pipe(Box<Expr>, Vec<Expr>),
+    Loop(Box<Self>, Box<Self>),
+    Member(Box<Self>, Token),
+    Named(Kind<Token>, Box<Self>),
+    Path(Box<Self>, Token),
+    Pipe(Box<Self>, Vec<Self>),
     Program(Program),
-    Range(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+    Range(Box<Self>, Box<Self>, Option<Box<Self>>),
     Record(Kind<Token>, Vec<Binding>),
-    Return(Box<Expr>, Box<Expr>),
-    Tuple(Vec<Expr>),
-    Unary(Token, Box<Expr>),
-    Variable(Vec<Binding>, Box<Expr>),
-    Vector(Vec<Expr>),
+    Return(Box<Self>, Box<Self>),
+    Structure(Token, Shape, Vec<Parameter>),
+    Tuple(Vec<Self>),
+    Unary(UnOp, Box<Self>),
+    Variable(Vec<Binding>, Box<Self>),
+    Vector(Vec<Self>),
 }
+
+pub struct Type {}
 
 impl From<Token> for Expr {
     fn from(token: Token) -> Self {
         match token {
       Token::Bool(..) | Token::String(..) | Token::Number(..) | Token::Identifier(..) => Self::Literal(token),
-      Token::Empty() => Expr::Nil,
-      _ => Expr::Error(Halt::InvalidInput("Only booleans, strings, numbers, and variables may be parsed as Literal Expressions!".to_string()), token)
+      Token::Empty => Expr::Empty,
+      _ => Expr::Error(Halt::InvalidInput("Only booleans, strings, numbers, and identifiers may be parsed as Literal Expressions!".to_string()), token)
     }
     }
 }
 
 impl Expr {
-    pub fn from_token(token: Token) -> Expr {
-        Self::from(token)
-    }
-    pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error(..))
-    }
-    pub fn from_operator(
-        token: &Token,
-    ) -> fn(Token, Box<Expr>, Box<Expr>) -> Expr {
-        match token.operator_info() {
-            // ALL ASSIGNMENT OPERATORS ARE RIGHT ASSOCIATIVE WITH PREC 1
-            // "=" | "<-" | "=<" | "+=" | "-="
-            Some((1, Assoc::Right)) => Self::Assign,
-            Some((..)) | _ => Self::Binary,
+    // pub fn from_operator(
+    //     token: &Token,
+    // ) -> fn(Token, Box<Self>, Box<Self>) -> Self {
+    //     match token.operator_info() {
+    //         // ALL ASSIGNMENT OPERATORS ARE RIGHT ASSOCIATIVE WITH PREC 1
+    //         // "=" | "<-" | "=<" | "+=" | "-="
+    //         Some((1, Assoc::Right)) => Self::Assign,
+    //         Some((..)) | _ => Self::Binary,
+    //     }
+    // }
+}
+
+impl Literal<String> for Expr {
+    type Lit = String;
+    fn literal(&self) -> Self::Lit {
+        let mut literal = String::new();
+        macro_rules! join {
+            ($x:expr) => {
+                join! {$x, ", "}
+            };
+            ($x:expr, $d:literal) => {
+                &*$x.into_iter()
+                    .map(|m| m.literal())
+                    .collect::<Vec<_>>()
+                    .join($d)
+            };
+            ($left:literal -> $ex:expr => $sep:literal -> $right:literal) => {{
+                let inner = &*join!($ex, $sep);
+                format!("{}{}{}", stringify!($left), inner, stringify!($right))
+                    .as_str()
+            }};
         }
+        match self {
+            Expr::Assign(a, b, c) => literal.push_str(
+                &*[&*b.literal(), " ", &*a.literal(), " ", &*c.literal()]
+                    .concat(),
+            ),
+            Expr::Binary(a, b, c) => {
+                literal.push_str(
+                    &*[&*b.literal(), " ", &*a.literal(), " ", &*c.literal()]
+                        .concat(),
+                );
+            }
+            Expr::Block(t, ts) => literal.push_str(
+                &*[&*t.literal(), " {\n", &*join!(ts, ";\n"), "\n}"].concat(),
+            ),
+            Expr::Call(a, b, c) => literal.push_str(
+                &[&*a.literal(), join!("(" -> b => "," -> ")")].concat(),
+            ),
+            Expr::Case(_, _, _) => todo!(),
+            Expr::Conditional(a, b, c) => {}
+            Expr::Constant(a) => todo!(),
+            Expr::Data(d, vs) => literal.push_str(
+                &*[
+                    "data",
+                    d.0.literal().as_str(),
+                    "::",
+                    "{\n",
+                    join!(vs, "\n\t| "),
+                    "\n}",
+                ]
+                .concat(),
+            ),
+            Expr::Empty => {}
+            Expr::Error(_, _) => todo!(),
+            Expr::Ident(tok, _) => literal.push_str(tok.literal().as_str()),
+            Expr::Index(a, b) => {
+                literal.push_str(
+                    &*[&*a.literal(), "[", &*b.literal(), "]"].concat(),
+                );
+            }
+            Expr::Instance(a, b) => {
+                literal.push_str(&*[&*a.literal(), " {\n"].concat());
+                for (t, e) in b {
+                    literal.push_str(
+                        &*["\t", &*t.literal(), ": ", &*e.literal(), ",\n"]
+                            .concat(),
+                    )
+                }
+                literal.push_str("}");
+            }
+            Expr::Iter(a, b) => literal.push_str(
+                &*[
+                    "(",
+                    &*a.literal(),
+                    "..",
+                    &*(match b {
+                        Some(end) => end.literal(),
+                        _ => String::new(),
+                    }),
+                    ")",
+                ]
+                .concat(),
+            ),
+            Expr::Lambda(b, c) => {
+                // let mut nm = if let Some(name) = a {
+                //     [String::from("fn "), name.literal(), " ".to_string()]
+                //         .concat()
+                // } else {
+                //     String::new()
+                // };
+                literal.push_str(
+                    &*[
+                        join!(b
+                            .iter()
+                            .map(|p| &p.pattern)
+                            .collect::<Vec<_>>()),
+                        &*c.literal(),
+                    ]
+                    .concat(),
+                );
+            }
+            Expr::Function(a, b, c, d) => literal.push_str(
+                &*[
+                    &*a.literal(),
+                    join!(b.iter().map(|p| &p.pattern).collect::<Vec<_>>()),
+                    &*match c {
+                        Some(ret) => {
+                            let mut rets = String::from(" -> ");
+                            rets.push_str(&ret.literal());
+                            rets.push_str(", ");
+                            rets
+                        }
+                        None => String::from(" "),
+                    },
+                    &*d.literal(),
+                ]
+                .concat(),
+            ),
+            Expr::List(_) => todo!(),
+            Expr::Literal(t) => literal.push_str(t.literal().as_str()),
+            Expr::Loop(a, b) => literal.push_str(
+                &*["loop (", &*a.literal(), ")\n\t(", &*b.literal()].concat(),
+            ),
+            Expr::Path(a, b) | Expr::Member(a, b) => literal
+                .push_str(&*[&*a.literal(), ".", &*b.literal()].concat()),
+            Expr::Named(_, _) => todo!(),
+            Expr::Pipe(a, b) => literal.push_str(
+                &*[&*a.literal(), " |> ", join!(b, " |> ")].concat(),
+            ),
+            Expr::Program(Program { body, .. }) => {
+                literal.push_str(join!(body, ";\n"));
+            }
+            Expr::Range(a, b, c) => literal.push_str(
+                &*[
+                    &*a.literal(),
+                    "[",
+                    &*Expr::Iter(b.clone(), c.clone()).literal(),
+                    "]",
+                ]
+                .concat(),
+            ),
+            Expr::Record(_, b) => literal.push_str(
+                &*[
+                    "#{ ",
+                    &*b.into_iter()
+                        .map(
+                            |Binding {
+                                 pram:
+                                     Parameter {
+                                         kind,
+                                         pattern,
+                                         shape,
+                                     },
+                                 expr,
+                             }| {
+                                let knd = kind.literal();
+                                let prop = pattern.literal();
+                                let left = if knd.is_empty() {
+                                    prop
+                                } else {
+                                    [prop, ": ".to_string(), knd].concat()
+                                };
+                                let right = expr.literal();
+                                if right.is_empty() {
+                                    left
+                                } else {
+                                    [left, " = ".to_string(), right].concat()
+                                }
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    " }",
+                ]
+                .concat(),
+            ),
+            Expr::Return(_, _) => todo!(),
+            Expr::Structure(a, b, c) => {
+                let (left, right) = match b {
+                    Shape::Tuple => ("(", ")"),
+                    Shape::Vector => ("[", "]"),
+                    Shape::Struct | Shape::Record => ("{", "}"),
+                    Shape::Empty | _ => ("", ""),
+                };
+                let x = &*[
+                    "struct ",
+                    &*a.literal(),
+                    left,
+                    &*c.iter()
+                        .map(|Parameter { kind, pattern, .. }| {
+                            ["\t", &*pattern.literal(), ": ", &*kind.literal()]
+                                .concat()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",\n"),
+                    right,
+                ]
+                .concat();
+            }
+            Expr::Tuple(ts) => {
+                literal.push_str(join!("(" -> ts => ", " -> ")"))
+            }
+            Expr::Unary(a, b) => {
+                literal.push_str(&*[a.literal(), b.literal()].concat())
+            }
+            Expr::Variable(a, b) => literal.push_str(
+                &*[
+                    "let\n\t",
+                    &*a.into_iter()
+                        .map(
+                            |Binding {
+                                 pram:
+                                     Parameter {
+                                         kind,
+                                         pattern,
+                                         shape,
+                                     },
+                                 expr,
+                             }| {
+                                let knd = kind.literal();
+                                let prop = pattern.literal();
+                                let left = if knd.is_empty() {
+                                    prop
+                                } else {
+                                    [
+                                        "\t".to_string(),
+                                        prop,
+                                        ": ".to_string(),
+                                        knd,
+                                    ]
+                                    .concat()
+                                };
+                                let right = expr.literal();
+                                if right.is_empty() {
+                                    left
+                                } else {
+                                    [left, " = ".to_string(), right].concat()
+                                }
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "\n\tin\n\t",
+                    &*b.literal(),
+                ]
+                .concat(),
+            ),
+            Expr::Vector(_) => todo!(),
+        };
+        literal
     }
 }
 
@@ -250,11 +463,21 @@ pub enum Shape {
     Vector,
     List,
     Record,
+    Struct,
     Closure,
     Holder,
     Unknown,
     Empty,
-    Nested(Rc<Shape>),
+    Binary,
+    Unary,
+    Union,
+    At,
+    Spread,
+    Rest,
+    Wild,
+    Call,
+    Meta,
+    Iter,
     // special ryg generic, aka for "any"
     R,
 }
@@ -267,19 +490,52 @@ impl Shape {
 
 impl From<Token> for Shape {
     fn from(token: Token) -> Shape {
-        if matches!(token.clone(), Token::Identifier(..) | Token::Meta(..)) {
+        if matches!(&token, Token::Identifier(..)) {
             Shape::Atom
+        } else if matches!(&token, Token::Meta(..)) {
+            Shape::Struct
         } else {
-            match token.clone().to_string().as_str() {
+            match token.to_string().as_str() {
                 "(" => Shape::Tuple,
                 "[" => Shape::Vector,
                 "{" => Shape::Record,
-                "|" => Shape::Closure,
-                "_" => Shape::R,
+                "|" => Shape::Empty,
+                "_" => Shape::Empty,
                 _ => Shape::Unknown,
             }
         }
     }
+}
+
+impl From<Morpheme<Token, Expr>> for Shape {
+    fn from(morpheme: Morpheme<Token, Expr>) -> Self {
+        match morpheme {
+            Morpheme::Empty => Self::Empty,
+            Morpheme::Wild(_) => Self::Wild,
+            Morpheme::Rest(_) => Self::Rest,
+            Morpheme::Meta(_) => Self::Meta,
+            Morpheme::Atom(_) => Self::Record,
+            Morpheme::Spread(_) => Self::Atom,
+            Morpheme::Tuple(_) => Self::Spread,
+            Morpheme::Vector(_) => Self::Tuple,
+            Morpheme::Record(_) => Self::Vector,
+            Morpheme::Iter(_) => Self::Iter,
+            Morpheme::Struct(..) => Self::Struct,
+            Morpheme::Call(..) => Self::Call,
+            Morpheme::Unary(..) => Self::Unary,
+            Morpheme::Binary(..) => Self::Binary,
+            Morpheme::Closure(..) => Self::Closure,
+            Morpheme::Union(_) => Self::Union,
+            Morpheme::At(..) => Self::At,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListDef {
+    item: Expr,
+    ranges: Vec<(Morpheme<Token, Expr>, Expr)>,
+    preds: Vec<Expr>,
 }
 
 simple_pub_struct! {
@@ -294,12 +550,13 @@ simple_pub_struct! {
 impl From<Definition> for Shape {
     fn from(defn: Definition) -> Shape {
         match defn.item {
-            Expr::Nil => Shape::Empty,
+            Expr::Empty => Shape::Empty,
             Expr::Vector(_) => Shape::Vector,
             Expr::Literal(_) => Shape::Atom,
             Expr::Tuple(_) => Shape::Tuple,
             Expr::List(_) => Shape::List,
             Expr::Record(_, _) => Shape::Record,
+            Expr::Instance(_, _) => Shape::Struct,
             Expr::Unary(_, _) => Shape::Atom,
             Expr::Binary(_, _, _) => Shape::Holder,
             Expr::Lambda(..) => Shape::Closure,
@@ -308,13 +565,34 @@ impl From<Definition> for Shape {
     }
 }
 
-simple_pub_struct! {
-    Parameter :: {
-        name: Token,
-        pattern: Morpheme,
+#[derive(Clone, Debug, PartialEq)]
+pub struct Parameter {
+    pub pattern: Morpheme<Token, Expr>,
+    pub shape: Shape,
+    pub kind: Morpheme<Token, Expr>,
+}
+
+impl Parameter {
+    pub fn new(
+        pattern: Morpheme<Token, Expr>,
         shape: Shape,
-        kind: Morpheme
-    } + Clone, Debug, PartialEq
+        kind: Option<Morpheme<Token, Expr>>,
+    ) -> Self {
+        Self {
+            pattern,
+            shape,
+            kind: match kind {
+                Some(k) => k,
+                _ => Morpheme::Empty,
+            },
+        }
+    }
+    pub fn get_tokens(&self) -> Vec<&Token> {
+        self.pattern.get_tokens()
+    }
+    pub fn len(&self) -> usize {
+        self.get_tokens().len()
+    }
 }
 
 // Variables bound to values currently in scope
@@ -328,109 +606,78 @@ simple_pub_struct! {
 
 simple_pub_struct! {
     VariantArg :: {
-        morpheme: Morpheme,
+        morpheme: Morpheme<Token, Expr>,
     } + Clone, Debug, PartialEq
 }
 
 simple_pub_struct! {
-    DataVariant :: {
+    Variant :: {
         ident: Kind<Token>,
-        items: Vec<Morpheme>
+        items: Vec<Morpheme<Token, Expr>>
     } + Clone, Debug, PartialEq
 }
 
-simple_pub_struct! {
-    DataDef :: {
-        kind: Kind<Token>,
-        variants: Vec<DataVariant>
-    } + Clone, Debug, PartialEq
+impl Literal for Variant {
+    type Lit = String;
+    fn literal(&self) -> Self::Lit {
+        let mut literal = String::new();
+        literal.push_str(&*[self.ident.0.literal().as_str(), " "].concat());
+        literal.push_str(
+            &*self
+                .items
+                .iter()
+                .map(|p| p.literal())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        literal
+    }
 }
 
 impl fmt::Display for Expr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // macro_rules! map {
+        //     ($kind:tt )
+        // }
         match self {
-            Expr::Nil => write!(f, "()"),
-            Expr::Literal(t) => write!(f, "{}", t),
-            Expr::Unary(a, b) => write!(f, "(Unary {} {})", a, b),
-            Expr::Binary(a, b, c) => {
-                write!(f, "(Binary {} {} {})", a, *b, *c)
-            }
             Expr::Assign(a, b, c) => {
-                write!(f, "(Assign {} {} {})", a, *b, *c)
+                write!(
+                    f,
+                    "(Assign {} {})",
+                    a,
+                    format_args!("\n\t{}\n\t{}", b.as_ref(), c.as_ref())
+                )
             }
-            Expr::Block(d, a) => {
-                write!(f, "(Block {}{:#?})", if *d { "do " } else { "" }, a)
+            Expr::Binary(a, b, c) => {
+                write!(
+                    f,
+                    "(Bin {} {})",
+                    a,
+                    format_args!("\n\t{}\n\t{}", b.as_ref(), c.as_ref())
+                )
             }
-            Expr::Call(a, b, c) => write!(
-                f,
-                "(Call {} {:#?} {})",
-                *a,
-                b,
-                if let Some(name) = &c {
-                    name.literal()
-                } else {
-                    String::new()
+            Expr::Block(a, b) => {
+                write!(f, "(Block {} {})", a, format_args!("\n\t{:#?}", b))
+            }
+            _ => write!(f, "{:#?}", &self),
+            Expr::Program(Program { name, body, vocab }) => {
+                if let Some(name) = name {
+                    writeln!(f, "[Program::{}] {{", name);
+                };
+                writeln!(f, "\tbank: {:#?},", &vocab);
+                writeln!(f, "\tbody: [");
+                for (i, x) in body.iter().enumerate() {
+                    writeln!(f, "\t [{}]:\t {}", i, x);
                 }
-            ),
-            Expr::Case(a, b, c) => {
-                write!(f, "(Case {} {:#?} {})", *a, b, *c)
+                writeln!(f, "\t]\n}}")
             }
-            Expr::Conditional(a, b, c) => {
-                write!(
-                    f,
-                    "(Conditional {:?} {:?} {:?})",
-                    *a,
-                    *b,
-                    if let Some(expr) = c { expr } else { &Expr::Nil }
-                )
-            }
-            Expr::Lambda(a, b, c) => {
-                write!(
-                    f,
-                    "(Lambda {} {:#?} {})",
-                    if let Some(name) = a {
-                        name.literal()
-                    } else {
-                        "ʎ".to_string()
-                    },
-                    b,
-                    *c
-                )
-            }
-            Expr::Variable(a, b) => write!(f, "(Let {:#?} {})", a, *b),
-            Expr::Vector(a) => write!(f, "(Vector {:#?})", a),
-            Expr::List(a) => write!(f, "(List {:#?})", a),
-            Expr::Tuple(b) => write!(f, "(Tuple {:#?})", b),
-            Expr::Index(a, b) => write!(f, "(Index {} {})", *a, *b),
-            Expr::Iter(a, b) => write!(
-                f,
-                "(Iter {:?} {:?})",
-                *a,
-                if let Some(expr) = b { expr } else { &Expr::Nil }
-            ),
-            Expr::Range(a, b, c) => {
-                write!(
-                    f,
-                    "(Range {:?} {:?} {:?})",
-                    *a,
-                    *b,
-                    if let Some(expr) = c { expr } else { &Expr::Nil }
-                )
-            }
-            Expr::Loop(a, b) => write!(f, "(Loop {:?} {:?})", *a, *b),
-            Expr::Error(a, b) => write!(f, "(Error {} {}", a, b),
-            Expr::Return(a, b) => write!(f, "(Return {} {} )", *a, *b),
-            Expr::Named(a, b) => write!(f, "(Named {} {})", a, *b),
-            // Expr::Pattern(a, b) => write!(f, "(Pattern {:?} {:?})", a, b),
-            Expr::Record(a, b) => write!(f, "(Record {} {:#?})", a, b),
-            _ => write!(f, "{:#?}", self),
         }
     }
 }
 
 impl fmt::Display for Kind<Token> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.0.literal())
     }
 }
 
@@ -440,241 +687,16 @@ impl fmt::Display for Kind<String> {
     }
 }
 
-pub trait Visit<X: Clone> {
-    fn visit<F>(&self, cont: &mut F)
-    where
-        F: FnMut(&X);
-}
-
-impl Visit<Token> for Expr {
-    fn visit<F: FnMut(&Token)>(&self, mut visit: &mut F) {
-        match self {
-            Expr::Nil => visit(&Token::Empty()),
-            Expr::Assign(op, left, right) => {
-                visit(op);
-                left.visit(visit);
-                right.visit(visit);
-            }
-            Expr::Binary(op, left, right) => {
-                visit(op);
-                right.visit(visit);
-                left.visit(visit);
-            }
-            Expr::Block(is_do, xs) => {
-                xs.iter().fold((), |a, c| c.visit(visit));
-            }
-            Expr::Call(func, args, name) => {
-                func.visit(visit);
-                args.iter().for_each(|expr| expr.visit(visit));
-                if let Some(id) = name {
-                    visit(&id);
-                };
-            }
-            Expr::Case(subj, conds, deft) => {
-                subj.visit(visit);
-                deft.visit(visit);
-                conds.iter().for_each(|(pat, branch)| {
-                    pat.visit(visit);
-                    branch.visit(visit);
-                });
-            }
-            Expr::Conditional(cond, then, deft) => {
-                cond.visit(visit);
-                then.visit(visit);
-                if let Some(expr) = deft {
-                    expr.visit(visit);
-                }
-            }
-            Expr::Index(item, index) => {
-                item.visit(visit);
-                index.visit(visit);
-            }
-            Expr::Member(item, field) => {
-                item.visit(visit);
-                visit(field);
-            }
-            Expr::Iter(start, end) => {
-                start.visit(visit);
-                if let Some(end_) = end {
-                    end_.visit(visit);
-                }
-            }
-            Expr::List(defn) => {
-                let Definition {
-                    ranges,
-                    conds,
-                    fixed,
-                    item,
-                } = defn.as_ref();
-                ranges.iter().for_each(|(a, b)| {
-                    a.visit(visit);
-                    b.visit(visit);
-                });
-                conds.iter().for_each(|x| {
-                    x.visit(visit);
-                });
-                fixed.iter().for_each(|(id, vardef)| {
-                    id.visit(visit);
-                    vardef.visit(visit)
-                });
-                item.visit(visit);
-            }
-            Expr::Range(body, start, end) => {
-                body.visit(visit);
-                start.visit(visit);
-                if let Some(end_) = end {
-                    end_.visit(visit);
-                };
-            }
-            Expr::Lambda(name, prams, body) => {
-                if let Some(id) = name {
-                    visit(id);
-                    prams.iter().for_each(
-                        |Parameter {
-                             name,
-                             pattern,
-                             shape,
-                             kind,
-                         }| {
-                            visit(name);
-                            pattern.get_tokens().iter().for_each(|tok| {
-                                visit(*tok);
-                            });
-                            kind.get_tokens().iter().for_each(|tok| {
-                                visit(*tok);
-                            });
-                        },
-                    )
-                }
-            }
-            Expr::Literal(tok) => {
-                visit(tok);
-            }
-            Expr::Loop(cond, body) => {
-                cond.visit(visit);
-                body.visit(visit);
-            }
-            Expr::Tuple(items) => items.iter().for_each(|x| {
-                x.visit(visit);
-            }),
-            Expr::Unary(op, rhs) => {
-                visit(op);
-                rhs.visit(visit);
-            }
-            Expr::Constant(bindings) => bindings.iter().for_each(
-                |Binding {
-                     pram:
-                         Parameter {
-                             name,
-                             pattern,
-                             shape,
-                             kind,
-                         },
-                     expr,
-                 }| {
-                    visit(name);
-                    pattern.get_tokens().iter().for_each(|tok| {
-                        visit(*tok);
-                    });
-                    kind.get_tokens().iter().for_each(|tok| {
-                        visit(*tok);
-                    });
-                    expr.visit(visit);
-                },
-            ),
-            Expr::Variable(bindings, body) => {
-                bindings.iter().for_each(
-                    |Binding {
-                         pram:
-                             Parameter {
-                                 name,
-                                 pattern,
-                                 shape,
-                                 kind,
-                             },
-                         expr,
-                     }| {
-                        visit(name);
-                        pattern.get_tokens().iter().for_each(|tok| {
-                            visit(*tok);
-                        });
-                        kind.get_tokens().iter().for_each(|tok| {
-                            visit(*tok);
-                        });
-                        expr.visit(visit);
-                    },
-                );
-                body.visit(visit)
-            }
-            Expr::Vector(items) => items.iter().for_each(|x| {
-                x.visit(visit);
-            }),
-            Expr::Error(_, _) => todo!(),
-            Expr::Return(_, _) => todo!(),
-            Expr::Named(_, _) => todo!(),
-            Expr::Record(kind, bindings) => {
-                visit(&kind.0);
-                bindings.iter().for_each(
-                    |Binding {
-                         pram:
-                             Parameter {
-                                 name,
-                                 pattern,
-                                 shape,
-                                 kind,
-                             },
-                         expr,
-                     }| {
-                        visit(name);
-                        pattern.get_tokens().iter().for_each(|tok| {
-                            visit(*tok);
-                        });
-                        kind.get_tokens().iter().for_each(|tok| {
-                            visit(*tok);
-                        });
-                        expr.visit(visit);
-                    },
-                );
-            }
-            Expr::Data(name, dvs) => {
-                visit(&name.0);
-                dvs.iter().for_each(|DataVariant { ident, items }| {
-                    visit(&ident.0);
-                    items.iter().for_each(|pram| {
-                        pram.get_tokens().iter().for_each(|tok| {
-                            visit(*tok);
-                        });
-                    })
-                })
-            }
-            Expr::Pipe(arg, pipes) => {
-                arg.visit(visit);
-                pipes.iter().for_each(|x| {
-                    x.visit(visit);
-                });
-            }
-            Expr::Program(Program {
-                name: _,
-                body,
-                vocab: _,
-            }) => {
-                body.iter().for_each(|expr| {
-                    expr.visit(visit);
-                });
-            }
-            Expr::Path(root, branch) => {
-                root.visit(visit);
-                visit(branch);
-            }
-        };
-    }
-}
-
 #[cfg(test)]
 mod test {
     use crate::{parsing::parser::parse_input, tok::lexer::Pos};
 
     use super::*;
+
+    use crate::{
+        core::rygval::RygVal, evaluating::environment::Envr, log_do,
+        util::types::Maybe,
+    };
 
     #[test]
     fn vector_morpheme_tokens() {
@@ -702,16 +724,83 @@ mod test {
     }
 
     #[test]
-    fn walk_expr() {
-        let src1 = "if true then 1 else 0";
+    fn morpheme_literal() {
+        let morpheme = Morpheme::Vector(vec![
+            Morpheme::Atom(Token::Identifier(String::from("a"), Pos::faux())),
+            Morpheme::Tuple(vec![
+                Morpheme::Atom(Token::Identifier(
+                    String::from("b"),
+                    Pos::faux(),
+                )),
+                Morpheme::Atom(Token::Identifier(
+                    String::from("c"),
+                    Pos::faux(),
+                )),
+            ]),
+            Morpheme::Rest(Token::Identifier(String::from("c"), Pos::faux())),
+        ]);
+        let morphstr = morpheme.literal();
+        println!("{}", morphstr);
+    }
 
-        let ast1 = parse_input(src1);
-        let mut toks = vec![];
-        let mut i = 0;
-        ast1.visit(&mut |tok| {
-            println!("(i, tok): ({}, {})", &i, tok);
-            toks.push(tok.clone());
-            i += 1;
+    #[test]
+    fn morphemes_literal() {
+        let src = "a, ...[b, c]";
+        let ast = parse_input(&*format!("|{}| {{}}", &src));
+        if let Expr::Program(Program { body, .. }) = ast {
+            if let [Expr::Lambda(pram, _)] = &body[..] {
+                let pp = pram
+                    .iter()
+                    .map(|p| p.pattern.literal())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("{}", &pp);
+                assert_eq!(&pp, src)
+            }
+        }
+    }
+
+    #[test]
+    fn expr_code() {
+        let expr = Expr::Assign(
+            AssignOp::from_token(&Token::from("<-")).unwrap(),
+            Box::new(Expr::Literal(Token::from("x"))),
+            Box::new(Expr::Literal(Token::from("y"))),
+        );
+        let prog = expr.literal();
+        println!("{}", prog)
+    }
+
+    #[test]
+    fn ops_from_token() {
+        let pos = Pos::new();
+        let tok1 = Token::Operator("+".to_string(), pos.clone());
+        let tok2 = Token::Operator("<>".to_string(), pos.clone());
+        let op1 = BinOp::from_token(&tok1);
+        let op2 = BinOp::from_token(&tok2);
+        log_do!(
+            tok1 => tok1, tok2 => tok2, op1 => op1, op2 => op2
+        )
+    }
+    #[test]
+    fn unary() {
+        let tok = Token::from("!");
+        let expr = Expr::Literal(Token::Bool(true, {
+            let mut pos = Pos::faux();
+            pos.next(&'!');
+            pos
+        }));
+        let unexpr = Unary::from((tok, expr));
+        println!("{:?}", &unexpr);
+        unexpr.visit(|op| {
+            move |x| println!("visiting {:?} {:?}", op, x.clone())
+            // match op {
+            //     UnOp::Ref => |x| {println!("{:?}", &x); },
+            //     UnOp::Deref => todo!(),
+            //     UnOp::Neg => |x| ,
+            //     UnOp::Not => todo!(),
+            //     UnOp::BitNot => todo!(),
+            // }
         })
     }
 }

@@ -1,48 +1,65 @@
 use std::fmt;
 
-use super::stream::Pos;
+use crate::{color, quick_match};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+use super::{literal::Literal, stream::Pos};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Assoc {
     Left,
     Right,
 }
 
-#[allow(unused)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Token {
-    Bool(String, Pos),
+    Bool(bool, Pos),
     Char(char, Pos),
-    Empty(),
+    Closed(char, Pos),
+    Empty,
     Eof(Pos),
+    Generic(String, Pos),
     Identifier(String, Pos),
     Invalid(String, Pos),
     Keyword(String, Pos),
     Meta(String, Pos),
     Number(String, u8, Pos),
+    Open(char, Pos),
     Operator(String, Pos),
     Punct(char, Pos),
     String(String, Pos),
     Symbol(String, Pos),
 }
 
-#[allow(unused)]
-impl Token {
-    pub fn literal(&self) -> String {
+impl Default for Token {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+impl Literal for Token {
+    type Lit = String;
+    fn literal(&self) -> Self::Lit {
         match &self {
-            Token::Number(b, _, _)
-            | Token::String(b, _)
-            | Token::Bool(b, _)
-            | Token::Identifier(b, _)
-            | Token::Symbol(b, _)
-            | Token::Operator(b, _)
-            | Token::Invalid(b, _)
-            | Token::Meta(b, _)
-            | Token::Keyword(b, _) => b.into(),
-            Token::Char(b, _) | Token::Punct(b, _) => b.to_string(),
-            Token::Eof(_) | Token::Empty() => "".into(),
+            Self::Number(b, _, _)
+            | Self::String(b, _)
+            | Self::Identifier(b, _)
+            | Self::Symbol(b, _)
+            | Self::Operator(b, _)
+            | Self::Invalid(b, _)
+            | Self::Meta(b, _)
+            | Self::Generic(b, _)
+            | Self::Keyword(b, _) => b.into(),
+            Self::Bool(b, _) => b.to_string(),
+            Self::Char(b, _)
+            | Self::Punct(b, _)
+            | Self::Open(b, _)
+            | Self::Closed(b, _) => b.to_string(),
+            Self::Eof(_) | Self::Empty => String::new(),
         }
     }
+}
+
+impl Token {
     pub fn operator_info(&self) -> Option<((usize, Assoc))> {
         use Assoc::*;
         let (a, b, c, d, e, f) = (0, 3, 6, 9, 12, 15);
@@ -50,9 +67,8 @@ impl Token {
             let (prec, assoc) = match op.as_ref() {
                 // "." => (a, Left),
                 "<|" => (a, Right),
-                "=" | ":=" | "<-" | "=<" | "+=" | "-=" | "*=" | "/=" => {
-                    (a + 1, Right)
-                }
+                "=" | ":=" | "<-" | "=<" | "+=" | "-=" | "*=" | "/="
+                | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=" => (a + 1, Right),
                 // "=:" | "@:" | "#:" => (a + 1, Left),
                 "=>" | "&:" => (a + 2, Left),
                 "?>" | "!>" => (a + 2, Right),
@@ -64,6 +80,8 @@ impl Token {
                 // "@" => (c + 2, Right),
                 "==" | "!=" => (c + 2, Left),
                 "<" | "<=" | ">" | ">=" => (d, Left),
+                "<=>" => (d + 1, Left),
+                "<<" | ">>" => (d + 2, Left),
                 "<>" | "++" => (e, Right),
                 "+" | "-" => (e + 1, Left),
                 "*" | "/" | "%" | "mod" => (e + 2, Left),
@@ -100,13 +118,12 @@ impl Token {
         } else {
             Pos::faux()
         };
-        let accepted =
-            ["mod", "and", "or", "xor", "nor", "not"].iter().as_slice();
+        let accepted = ["mod", "and", "or", "xor", "not"].iter().as_slice();
         match self {
             (Self::Keyword(a, _) | Self::Meta(a, _))
                 if accepted.contains(&a.as_ref()) =>
             {
-                Self::Operator(a.to_owned(), pos).as_some()
+                Self::Operator(a.to_string(), pos).as_some()
             }
             Self::Symbol(a, _) if a.as_str() == "@" => {
                 Self::Operator(a.to_string(), pos).as_some()
@@ -168,20 +185,16 @@ impl Token {
             | Token::Keyword(_, p)
             | Token::Punct(_, p)
             | Token::Meta(_, p)
+            | Token::Generic(_, p)
             | Token::Invalid(_, p)
+            | Token::Open(_, p)
+            | Token::Closed(_, p)
             | Token::Eof(p) => Some(p),
-            Token::Empty() => None,
+            Token::Empty => None,
         }
     }
-
-    pub fn is_left_punct(&self) -> bool {
-        matches!(self, Token::Punct('(' | '[' | '{', _))
-    }
-    pub fn is_right_punct(&self) -> bool {
-        matches!(self, Token::Punct(')' | ']' | '}', _))
-    }
     pub fn is_unary(&self) -> bool {
-        self.match_any_of(&["!", "-", "~", "+", "*", "&"])
+        self.match_any_of(&["!", "not", "-", "~", "+", "*", "&"])
     }
 
     /// Returns `true` if the token is [`Eof`].
@@ -246,37 +259,56 @@ impl Token {
     ///
     /// [`Empty`]: Token::Empty
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty(..))
+        matches!(self, Self::Empty)
+    }
+
+    /// Returns `true` if the token is [`Open`], i.e., left-punct.
+    ///
+    /// [`Open`]: Token::Open
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open(..))
+    }
+
+    /// Returns `true` if the token is [`Closed`], i.e., right-punct.
+    ///
+    /// [`Closed`]: Token::Closed
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed(..))
+    }
+
+    /// Returns `true` if the token is [`Generic`].
+    ///
+    /// [`Generic`]: Token::Generic
+    pub fn is_generic(&self) -> bool {
+        matches!(self, Self::Generic(..))
     }
 }
 
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use crate::util::display::Paint;
-        let mag = Paint::fg_light_magenta;
-        let blue = Paint::fg_blue;
-        let cyan = Paint::fg_cyan;
-        let grn = Paint::fg_green;
-        let red = Paint::fg_red;
-        let ylw = Paint::fg_yellow;
-        let lt_red = Paint::fg_light_red;
-        let lt_ylw = Paint::fg_light_yellow;
-        let lt_mag = Paint::fg_light_magenta;
-        let lt_blue = Paint::fg_light_blue;
         let label = match self {
-            Token::Bool(s, _) => ("Bool", lt_mag(s)),
-            Token::Char(c, _) => ("Char", ylw(&c.to_string())),
-            Token::Empty() => ("", "".to_string()),
-            Token::Eof(_) => ("EOF", Paint::fg_light_black("\0")),
-            Token::Identifier(s, _) => ("Identifier", blue(s)),
-            Token::Invalid(s, _) => ("Invalid", red(s)),
-            Token::Keyword(s, _) => ("Keyword", lt_red(s)),
-            Token::Meta(s, _) => ("Meta", lt_blue(s)),
-            Token::Number(s, _, _) => ("Number", lt_mag(s)),
-            Token::Operator(s, _) => ("Operator", grn(s)),
-            Token::Punct(c, _) => ("Punct", mag(&c.to_string())),
-            Token::String(s, _) => ("String", cyan(s)),
-            Token::Symbol(s, _) => ("Symbol", lt_ylw(s)),
+            Token::Bool(s, _) => {
+                ("Bool", color!(fg LightMagenta s.to_string().as_str()))
+            }
+            Token::Char(c, _) => ("Char", color! {fg Yellow &c.to_string() }),
+            Token::Empty => ("", "".to_string()),
+            Token::Eof(_) => ("EOF", color!(fg LightBlack "\0")),
+            Token::Identifier(s, _) => ("Identifier", color!(fg Blue s)),
+            Token::Invalid(s, _) => ("Invalid", color!(fg Red s)),
+            Token::Keyword(s, _) => ("Keyword", color!(fg LightRed s)),
+            Token::Meta(s, _) => ("Meta", color!(fg LightBlue s)),
+            Token::Generic(s, _) => ("Generic", color!(fg LightCyan s)),
+            Token::Number(s, _, _) => ("Number", color!(fg LightMagenta s)),
+            Token::Operator(s, _) => ("Operator", color!(fg Green s)),
+            Token::Punct(c, _) => ("Punct", color!(fg Magenta &c.to_string())),
+            Token::String(s, _) => ("String", color!(fg Cyan s)),
+            Token::Symbol(s, _) => ("Symbol", color!(fg LightGreen s)),
+            Token::Open(c, _) => {
+                ("Open", color!(fg LightYellow &c.to_string()))
+            }
+            Token::Closed(c, _) => {
+                ("Closed", color!(fg LightYellow &c.to_string()))
+            }
         };
         write!(
             f,
@@ -288,9 +320,217 @@ impl fmt::Display for Token {
     }
 }
 
+/// Specific subsets of Token `[Operator]` variant, primarily used to reduce
+/// dependence on Strings when matching operator tokens later.
+pub trait FromToken {
+    type Output;
+    fn from_token(tok: &Token) -> Option<Self::Output>;
+}
+
+/// Enums corresponding to a literal, but that *don't* hold any data values,
+/// instead dynamically converting between literal and enum. Literal values are
+/// automatically recorded in doc comments for each enum variant.
+macro_rules! def_tok_set {
+    (meta $m:meta) => {$(#[$m])*};
+    (
+        $(#[$meta:meta])*
+        $opk:ident :: $(
+            $lit:literal $name:ident
+        )+
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum $opk {
+            $(
+                #[doc = $lit]
+                $name,
+            )+
+        }
+
+        impl FromToken for $opk {
+            type Output = Self;
+            fn from_token(tok: &Token) -> Option<Self::Output> {
+                quick_match! {
+                    Self =<< some tok.literal().as_str();
+                    $($lit $name),+
+                }
+            }
+        }
+
+        impl Literal for $opk {
+            type Lit = String;
+            fn literal(&self) -> Self::Lit {
+                let s = match self {
+                    $($name => $lit,)+
+                    _ => ""
+                };
+                s.to_string()
+            }
+        }
+
+        impl std::fmt::Display for $opk {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "{}", &self)
+            }
+        }
+    };
+    (L) => {Assoc::Left};
+    (R) => {Assoc::Right};
+    (ident $t:tt) => {$t};
+    ($opk:ident $knd:tt :: $($lit:literal $name:ident)+) => {
+        def_tok_set! { $opk :: $($lit $name)+ }
+
+        impl $opk {
+            pub fn $knd(word: &str) -> bool {
+                match word {
+                    $($lit => true,)+
+                    _ => false
+                }
+            }
+        }
+    };
+    (all $t1:literal $t2:tt, $opk:ident $knd:tt :: $($lit:literal $name:ident)+) => {
+        def_tok_set! { all $t1 $t2, $opk :: $($lit $name)+ }
+
+        impl $opk {
+           pub fn $knd(word: &str) -> bool {
+                match word {
+                    $($lit => true,)+
+                    _ => false
+                }
+            }
+
+        }
+    };
+    (all $t1:literal $t2:tt, $opk:ident :: $($ts:tt)+) => {
+        def_tok_set! { $opk :: $($ts)+ }
+
+        impl $opk {
+            pub fn get_prec(&self) -> usize {
+                $t1
+            }
+            pub fn get_assoc(&self) -> Assoc {
+                def_tok_set!($t2)
+            }
+        }
+    };
+}
+
+def_tok_set! { BinOp is_binary ::
+    // Test
+    "=>" Imply "||" Or "or" Or2
+    "&&" And "and" And2
+    "|" BitOr
+    "^" BitXor
+    "xor" BitXor2
+    "&" BitAnd
+    "<<" ShL ">>" ShR
+    "!=" NotEq "==" Equal
+    "<" Less "<=" LessEq ">" Greater ">=" GreaterEq
+    "<>" Conc "++" Comb
+    "+" Plus "-" Minus
+    "*" Times "/" Div "%" Rem "mod" Mod
+    "**" Pow "^^" Raise
+}
+
+def_tok_set! { all 1 R, AssignOp is_assign_op ::
+    "+=" Plus
+    "*=" Times
+    "-=" Minus
+    "/=" Div
+    "=_" Mod
+    "%=" Rem
+    "**=" Pow
+    "||=" Or
+    "&&=" And
+    // "?=" Nil
+    "&=" BitAnd
+    "^=" BitXor
+    "|=" BitOr
+    "~=" BitNot
+    "<<=" BitShL
+    ">>=" BitShR
+    "<>=" Conc
+    "++=" Comb
+    ":=" Def
+    "=" Set
+    "<-" Put
+    "=<" Bind
+}
+
+def_tok_set! { all 1 R, UnOp is_unary ::
+    "!" Not
+    "not" Not2
+    "-" Neg
+    "~" BitNot
+    "&" Ref
+    "*" Deref
+}
+
+macro_rules! def_tok_info {
+    (assoc L) => {Assoc::Left};
+    (assoc R) => {Assoc::Right};
+    (ident $id:ident) => {$id};
+    (ap $opk:ident ::
+        $($prec:literal $assoc:tt $($ids:ident)+),+
+    ) =>
+        (impl $opk {
+            pub fn get_prec(&self) -> usize {
+                match self {
+                    $($(Self::$ids => $prec,)+)+
+                    _ => 100
+                }
+            }
+            pub fn get_assoc(&self) -> Assoc {
+                match self {
+                    $($(Self::$ids => def_tok_info!(assoc $assoc),)+)+
+                    _ => Assoc::Left
+                }
+            }
+        });
+
+}
+
+def_tok_info! { ap BinOp ::
+    2 L Or Or2,
+    3 L And And2,
+    4 L BitOr,
+    5 L BitXor BitXor2,
+    6 L BitAnd,
+    7 L Equal NotEq,
+    8 L Less LessEq Greater GreaterEq,
+    9 L ShL ShR,
+    10 R Conc Comb,
+    11 L Plus Minus,
+    12 L Times Div Mod Rem,
+    13 R Pow
+}
+
+def_tok_set! { Kw is_kw ::
+    "do" Do
+    "let" Let
+    "in" In
+    "if" If
+    "then" Then
+    "else" Else
+    "loop" Loop
+    "case" Case
+    "of" Of
+    "where" Where
+    "data" Data
+    "fn" Fn
+    "this" This
+    "struct" Struct
+    "import" Import
+    "export" Export
+}
+
 #[cfg(test)]
 mod test {
-    use crate::tok::stream::{CharStream, Streaming};
+    use crate::{
+        log_do,
+        tok::stream::{CharStream, Streaming},
+    };
 
     use super::*;
     fn inspect_chars(src: &str) {
@@ -318,9 +558,22 @@ mod test {
     fn test_atomics() {
         let number = Token::Number("10".to_owned(), 0, Pos::new());
         let string = Token::String("hi".to_owned(), Pos::new());
-        let boolean = Token::Bool("true".to_owned(), Pos::new());
+        let boolean = Token::Bool(true, Pos::new());
         for t in [number, string, boolean].iter() {
             assert_eq!(t.is_atomic(), true);
         }
+    }
+
+    #[test]
+    fn tok_ops() {
+        let plus = Token::Operator("+".to_string(), Pos::new());
+        let binop = BinOp::from_token(&plus);
+        log_do!(
+            is_unary => UnOp::is_unary(plus.literal().as_ref()),
+            is_binary => BinOp::is_binary(plus.literal().as_ref()),
+            bin_op => binop,
+            assoc => BinOp::get_prec(binop.as_ref().unwrap()),
+            plus_is_binary => BinOp::is_binary("+")
+        );
     }
 }
