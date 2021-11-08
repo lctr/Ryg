@@ -85,19 +85,15 @@ impl Pos {
     }
 }
 
-impl fmt::Debug for Pos {
+impl fmt::Display for Pos {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "at {}:{}", self.row, self.col)
+        write!(f, "at {}:{}", self.row, self.col,)
     }
 }
 
-impl fmt::Display for Pos {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "(:pos {} :row {} :col {} :diff_line? {}",
-            self.pos, self.row, self.col, self.diff_line
-        )
+impl fmt::Debug for Pos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "at {}:{}", self.row, self.col)
     }
 }
 
@@ -119,6 +115,18 @@ impl<'a> CharStream<'a> {
 
     pub fn get_source(&self) -> &str {
         self.src
+    }
+
+    pub fn feed(&mut self, source: &'a str) {
+        self.chars = source.chars().peekable();
+    }
+
+    pub fn extend(&mut self, source: &'a str) -> Self {
+        Self {
+            pos: self.pos.clone(),
+            chars: source.chars().peekable(),
+            src: source,
+        }
     }
 
     pub fn get_line(&self) -> &str {
@@ -173,4 +181,34 @@ where
     S: Streaming,
     T: Clone,
 {
+}
+
+#[cfg(test)]
+mod test {
+    use crate::log_do;
+
+    use super::*;
+
+    #[test]
+    fn sync_char_pos() {
+        let mut chars = CharStream::new("1\n4");
+
+        log_do!(
+            "peek" => assert_eq!(chars.peek(), Some('1')),
+            "next" => {
+                let pos = Pos {pos: 0, row: 1, col: 0, diff_line: true};
+                assert_eq!(chars.get_pos(), pos)
+            },
+            "next" => {
+                chars.next();
+                let pos = Pos {pos: 1, row: 1, col: 1, diff_line: false};
+                assert_eq!(chars.get_pos(), pos)
+            },
+            "next" => {
+                chars.next();
+                let pos = Pos{pos: 2, row: 2, col: 0, diff_line: true};
+                assert_eq!(chars.get_pos(), pos)
+            }
+        )
+    }
 }
